@@ -2,13 +2,14 @@
 """
 main.py  ─ 스마트 정수기 통합 실행 파일
 =========================================
-구성 (6개 파일)
-  main.py              ← 진입점, 모드 선택, 스레드 시작
-  voice_module.py      ← 음성인식 상태머신
-  smart_water_core.py  ← 급수 제어 로직
-  gui_app.py           ← 실험자용 GUI (튜닝 패널, 그래프 포함)
-  user_kiosk_gui.py    ← 일반인용 GUI (키오스크 스타일)
-  csv_logger.py        ← 실험 결과 저장
+구성 (7개 파일)
+  main.py                ← 진입점, 모드 선택, 스레드 시작
+  voice_module.py        ← 음성인식 상태머신
+  smart_water_core.py    ← 급수 제어 로직
+  gui_app.py             ← 실험자용 GUI (튜닝 패널, 그래프, 자동 라벨 저장)
+  user_kiosk_gui.py      ← 일반인용 GUI (키오스크 스타일)
+  csv_logger.py          ← 실험 결과 저장
+  experiment_recorder.py ← 실험 시계열/요약(trial_summary.csv) 자동 기록
 
 실행:
   python3 main.py              ← 실행 시 콘솔에서 모드 선택
@@ -22,16 +23,6 @@ import time
 import sys
 
 import voice_module as voice
-
-
-# ── GUI 콜백 등록 함수 (gui_app.py / user_kiosk_gui.py 에서 호출) ──
-
-def register_gui_callbacks(on_cb, off_cb):
-    voice.register_gui_callbacks(on_cb, off_cb)
-
-
-def register_gui_level_callback(cb):
-    voice.register_gui_level_callback(cb)
 
 
 # ── 모드 선택 ─────────────────────────────────────────────────────────
@@ -66,7 +57,6 @@ def _select_mode_tkinter() -> str:
     GUI 환경에서 모달 다이얼로그로 모드를 선택한다.
     (터치스크린 환경에서 콘솔 입력이 불편할 때 사용)
     """
-    import tkinter as tk
     import customtkinter as ctk
 
     result = ['lab']  # 기본값

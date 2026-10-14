@@ -82,7 +82,6 @@ DISPLAY_FALL_PER_SEC   = 8.0         # 목표 수위를 낮추거나 정지 보�
 # 상태값 갱신은 12.5fps 수준으로 유지한다.
 CANVAS_ANIM_MS = 55                  # 컵/아우라 애니메이션 주기(ms). 급수 제어 DSP와 병행해도 과부하가 덜 생기도록 완화
 UI_UPDATE_MS   = 90                  # core 상태값을 GUI에 반영하는 주기(ms). 아우라와 수위 애니메이션 부하 분산
-VOICE_ORB_RENDER_SKIP = 1            # 음성 오브는 캐시 이미지를 사용하므로 매 프레임 갱신
 WATER_GRADIENT_STRIPS = 7           # 물 그라디언트 조각 수. 급수 중 캔버스 redraw 부하 완화
 VOICE_ORB_POINTS = 32                # 음성 오브 외곽 점 개수. 아우라 모양 유지하면서 렌더링 부하 완화
 VOICE_ORB_VOL_STEPS = 5              # 아우라 볼륨 단계 수. 캐시 단계 고정
@@ -155,13 +154,6 @@ DISPLAY_WATER_SETTLE_SECONDS = 0.25  # solenoid_on 직후 실제 물이 나오�
 DISPLAY_START_GUARD_SECONDS = 2.0    # 실제 물 출수 직후 비정상 추정값을 화면에 바로 반영하지 않는 시간
 DISPLAY_EARLY_SPIKE_LIMIT_PCT = 25.0 # 시작 직후 이 값보다 큰 추정 수위는 순간 튐으로 보고 무시
 DISPLAY_MIN_VALID_AIR_CM = 0.3       # air=0 같은 초기화값이 100%로 계산되는 것을 차단
-DISPLAY_MAX_BEHIND_RAW_PCT = 10.0    # 표시 수위가 안정 추정 수위보다 너무 뒤처지지 않게 제한
-DISPLAY_RAW_SOFT_AHEAD_PCT = 14.0    # 안정 추정 수위보다 이 정도 앞서는 것은 허용
-DISPLAY_RAW_STALE_RELAX_SECONDS = 0.5 # 안정 추정값이 갱신되지 않아도 이 시간 이후부터 상한 완화
-DISPLAY_RAW_STALE_RELAX_PER_SEC = 8.0 # 안정 추정값이 오래 멈춰 있을 때 표시 상한 완화 속도
-DISPLAY_RAW_UP_CONFIRM_SECONDS = 0.35 # 실제 추정 수위 상승이 이 시간 이상 반복될 때만 표시 목표에 반영
-DISPLAY_RAW_UP_MARGIN_PCT = 0.7      # 이 값 이상 오른 추정값만 상승 후보로 봄
-DISPLAY_RAW_JITTER_RESET_PCT = 5.5   # 상승 후보가 이 이상 흔들리면 확인 시간 초기화
 CORE_AUDIO_CLOSE_DELAY_SEC = 0.8     # 급수 종료 후 급수 분석용 오디오 스트림 정리 지연(s)
 DISPLAY_COMPLETE_HOLD_SEC = 5.0      # 급수 완료 후 가득 찬 화면을 유지하는 시간(s). 이후 0%로 복귀
 
@@ -190,7 +182,7 @@ def _profile_from_early_freq(freq_hz: float) -> str:
     return DISPLAY_PROFILE_MID
 
 
-import random, math
+import math
 
 
 class CupCanvas(tk.Canvas):
@@ -216,14 +208,11 @@ class CupCanvas(tk.Canvas):
         self._display_profile = DISPLAY_PROFILE_UNKNOWN  # 초반 주파수 기반 GUI 표시 속도 프로파일
         self._filling        = False
         self._voice          = False
-        self._voice_t        = 0
         self._wave_t         = 0
-        self._bubbles        = []  # 물방울 제거(GPU 부하 완화). 복구 시 [self._new_bubble() for _ in range(3)]
         self._complete_active = False
         self._complete_t      = 0
         self._anim_id        = None
         self._voice_photo    = None
-        self._orb_frame       = 0     # 기존 호환용 카운터. 실제 아우라는 시간 기준으로 진행
         self._voice_vol_smooth = 0.0  # 아우라 크기 표시용 볼륨 EMA
         self._voice_orb_cache = {}    # 보라색 음성 오브 PhotoImage 캐시. PIL 실시간 렌더링 반복을 줄임
         self._post_fill_recover_until = 0.0  # 급수 종료 후 애니메이션 타이밍 재정렬 구간
@@ -237,11 +226,6 @@ class CupCanvas(tk.Canvas):
         self.after(300, self._prebuild_voice_orb_cache)  # 앱 시작 후 아우라 프레임을 미리 생성
         self._redraw()
         self._animate()
-
-    def _new_bubble(self):
-        x = random.uniform(CUP_BX - CUP_BRX * 0.6, CUP_BX + CUP_BRX * 0.6)
-        y = random.uniform(CUP_BY - 10, CUP_BY - 5)
-        return [x, y, random.uniform(2, 4), random.uniform(0.4, 1.0)]
 
     def _prebuild_voice_orb_cache(self):
         """아우라 이미지를 미리 생성해 급수 후 첫 음성 입력 때 PIL 렌더링이 몰리지 않게 한다."""
@@ -259,7 +243,6 @@ class CupCanvas(tk.Canvas):
     def recover_animation_after_fill(self):
         """급수 후 밀린 애니메이션 타이밍을 재정렬한다. 음성인식 로직은 건드리지 않는다."""
         self._last_smooth_t = time.time()
-        # _voice_t/_orb_frame은 초기화하지 않는다. 초기화하면 다음 음성 입력 때 아우라가 첫 프레임부터 다시 시작해 끊겨 보인다.
         self._post_fill_recover_until = time.time() + 0.20
 
         try:
@@ -309,8 +292,6 @@ class CupCanvas(tk.Canvas):
             self._pct = max(0.0, min(100.0, self._pct + step))
 
         # 물방울 애니메이션 제거(GPU 부하 완화)
-        if self._voice:
-            self._voice_t += 1
         if self._filling:
             self._wave_t += 1
         if self._complete_active:
@@ -392,7 +373,6 @@ class CupCanvas(tk.Canvas):
 
         # ① 시리 오브 — 표시 상태는 VAD active만 따르되, 프레임은 실제 시간 기준으로 진행한다.
         if self._voice:
-            self._orb_frame += 1
             try:
                 raw_vol = float(getattr(core, 'mic_volume', 0.5))
             except (TypeError, ValueError):
@@ -434,7 +414,6 @@ class CupCanvas(tk.Canvas):
         if pct > 0.2:
             wy  = CUP_BY - CUP_INNER_H * (pct / 100.0)
             wrx = self._rx_at(wy)
-            wry = CUP_BRY + (CUP_TRY - CUP_BRY) * (pct / 100.0)
 
             strips = WATER_GRADIENT_STRIPS
             colors = ['#1e3a8a','#1e40af','#1d4ed8','#2055e0',
@@ -1227,7 +1206,6 @@ def run_kiosk_gui(on_ready=None):
                     kwargs=dict(
                         r2_final=r2, total_samples=len(snap),
                         theory_intercept=t_inter,
-                        stand_type='filled_box', stand_height_cm=3.0,
                         estimated_stop_air_cm=air,
                         init_air_len_cm=init_air,
                         actual_fill_pct=None,

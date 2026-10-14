@@ -1,12 +1,9 @@
-from datetime import datetime                                      # 백업 파일명 충돌 방지용
 import csv                                                         # CSV 저장용
 import os                                                          # 파일 존재 여부 확인용
 import smart_water_core as core                                    # 코어 상태값/상수 참조
 
 
-CSV_SCHEMA_VERSION = 'v6_model_lock_analysis'                         # CSV 구조 버전
-
-HEADER = [                                                         # D/H 모델 안정화 분석용 컬럼
+HEADER = [                                                         # v7: D/H 라운드 + mL 용적 + 자동 라벨 컬럼
     'Trial_No',                                                     # 날짜 없는 실험 순번
     'Cup_Type',                                                     # 컵 종류/용기 구분
     'Target_Fill_Pct',                                              # 목표 채움률(%)
@@ -42,7 +39,27 @@ HEADER = [                                                         # D/H 모델 
     'Spike_Blocked_Count',                                          # 스파이크 차단 횟수
     'Stop_Elapsed_Sec',                                             # 소음 보정 이후 정지까지 걸린 시간(s)
     'Control_Profile',                                              # 자동 판별된 진단 프로파일
+    'Ctrl_Stop_Freq_Hz',                                            # [v5.33] 정지 순간 제어 주파수(1초 raw 중앙값)
+    'Cup_Volume_Est_ml',                                            # [v5.33] 주파수 기반 추정 컵 용적 π(D/2)²·H
+    'Fill_Volume_Est_ml',                                           # [v5.33] 정지 순간 추정 채운 부피(mL)
+    'Est_Rounds',                                                   # [v5.33] 완료된 D/H 추정 라운드 수
+    'D_R1_cm', 'H_R1_cm',                                           # [v5.33] 1라운드 D/H
+    'D_R2_cm', 'H_R2_cm',                                           # [v5.33] 2라운드 D/H
+    'D_R3_cm', 'H_R3_cm',                                           # [v5.33] 3라운드 D/H
+    'Valve_Open_Sec',                                               # [v5.33] 밸브 열린 시간(s)
+    'Flow_Rate_ml_s',                                               # [v5.33] 라벨 계산에 쓴 유량(ml/s)
+    'Poured_Volume_ml',                                             # [v5.33] 유량 × 열린 시간(mL)
+    'Cup_Volume_Ref_ml',                                            # [v5.33] 라벨 기준 용적(mL)
+    'Label_Fill_Pct',                                               # [v5.33] 자동 라벨 = 급수량 ÷ 기준 용적 × 100
+    'Label_Source',                                                 # [v5.33] measured_cup_volume / estimated_cup_volume / none
 ]
+
+
+def _round_value(values, idx):                                     # 라운드 리스트에서 idx번째 값 꺼내기
+    try:                                                           # 리스트 접근 시도
+        return values[idx]                                         # 값 반환
+    except (IndexError, TypeError):                                # 해당 라운드가 없으면
+        return None                                                # 빈칸 처리
 
 
 def _num(value, default=0.0):                                      # 숫자 변환 보조 함수
@@ -153,18 +170,14 @@ def save_to_csv(                                                   # CSV 저장 
     r2_final=0.0,                                                  # 회귀 R²
     total_samples=0,                                               # 총 샘플 수
     theory_intercept=0.0,                                          # 1/f 회귀 절편
-    stand_type=None,                                               # 기존 코드 호환용, 저장 안 함
-    stand_height_cm=None,                                          # 기존 코드 호환용, 저장 안 함
     actual_air_cm=None,                                            # 실측 남은 공기층(cm)
     estimated_stop_air_cm=None,                                    # 정지 순간 추정 공기층(cm), 없으면 core 값 사용
-    target_air_cm=None,                                            # 기존 코드 호환용, 저장 안 함
-    stop_reason=None,                                              # 기존 코드 호환용, 저장 안 함
-    note=None,                                                     # 기존 코드 호환용, 저장 안 함
     init_air_len_cm=None,                                          # 코어에서 직접 읽은 초기 공기층(cm)
     actual_fill_pct=None,                                          # 실험자가 입력한 실측 채움률(%)
     cup_type=None,                                                 # 컵 종류/용기 구분
     target_fill_pct=None,                                          # 목표 채움률(%)
     stop_elapsed_sec=None,                                         # 정지까지 걸린 시간(s)
+    cup_volume_ref_ml=None,                                        # [v5.33] 실측 컵 용적(mL). 없으면 추정 용적으로 라벨
 ):
     """
     CSV 한 줄 저장.
@@ -213,6 +226,15 @@ def save_to_csv(                                                   # CSV 저장 
     if stop_elapsed_sec is None:                                   # 외부에서 종료 시간을 안 넘겼으면
         stop_elapsed_sec = getattr(core, 'last_stop_elapsed_sec', None)  # 코어 종료 시간 사용
 
+    # [v5.33] 자동 라벨: 유량 × 밸브 열린 시간 ÷ 기준 용적
+    cup_vol_est   = _num(getattr(core, 'cup_volume_ml', 0.0))          # 추정 컵 용적
+    valve_sec     = _num(core.get_valve_open_sec())                    # 밸브 열린 시간
+    poured_ml     = _num(core.poured_volume_ml())                      # 급수량
+    label_pct, label_src, label_ref_ml = core.compute_label_pct(poured_ml, cup_volume_ref_ml, cup_vol_est)
+    with core.lock:                                                # 라운드 리스트는 회귀 스레드가 갱신하므로 잠금 후 복사
+        round_d = list(getattr(core, 'round_d_cm', []))            # 라운드별 D
+        round_h = list(getattr(core, 'round_h_cm', []))            # 라운드별 H
+
     row = [                                                        # CSV 한 줄 구성
         int(trial_no),                                             # 실험 순번
         cup_type_text,                                             # 컵 종류
@@ -249,6 +271,19 @@ def save_to_csv(                                                   # CSV 저장 
         int(_num(getattr(core, 'spike_blocked_count', 0), 0)),     # 스파이크 차단 횟수
         _blank(stop_elapsed_sec, 3),                               # 정지까지 걸린 시간
         _safe_str(getattr(core, 'last_control_profile', 'default')),  # 진단 프로파일
+        _blank(getattr(core, 'last_decision_freq', None), 1),      # 정지 순간 제어 주파수
+        _blank(cup_vol_est if cup_vol_est > 0 else None, 1),       # 추정 컵 용적
+        _blank(getattr(core, 'last_fill_volume_ml', None), 1),     # 추정 채운 부피
+        int(_num(getattr(core, 'est_round', 0), 0)),               # 완료 라운드 수
+        _blank(_round_value(round_d, 0), 4), _blank(_round_value(round_h, 0), 4),  # 1라운드
+        _blank(_round_value(round_d, 1), 4), _blank(_round_value(round_h, 1), 4),  # 2라운드
+        _blank(_round_value(round_d, 2), 4), _blank(_round_value(round_h, 2), 4),  # 3라운드
+        _blank(valve_sec, 3),                                      # 밸브 열린 시간
+        _blank(getattr(core, 'FLOW_RATE', None), 3),               # 유량
+        _blank(poured_ml, 1),                                      # 급수량
+        _blank(label_ref_ml, 1),                                   # 라벨 기준 용적
+        _blank(label_pct, 2),                                      # 자동 라벨
+        label_src,                                                 # 라벨 출처
     ]
 
     try:                                                           # 저장 시도
@@ -261,6 +296,7 @@ def save_to_csv(                                                   # CSV 저장 
         print(f'\n[저장 완료] {filename}')                         # 저장 완료 출력
         print(f'  Trial_No={trial_no} | Cup={cup_type_text}')       # 실험 번호/컵 종류 출력
         print(f'  Target={target_pct:.1f}% | Actual={_blank(actual_fill_pct, 2)}% | Error={_blank(fill_error_pct, 2)}%')  # 오차 출력
+        print(f'  Label={_blank(label_pct, 2)}% ({label_src}) | Poured={poured_ml:.1f}mL / Ref={_blank(label_ref_ml, 1)}mL | Valve={valve_sec:.2f}s')  # 자동 라벨 출력
         print(f'  D_locked={_num(getattr(core, "last_d_locked_cm", 0.0)):.2f}cm | H_locked={_num(getattr(core, "last_init_air_locked_cm", init_air_len)):.2f}cm')  # 핵심 모델 출력
         print(f'  DecisionF={_num(decision_freq):.1f}Hz | RawF={_num(raw_stop_freq):.1f}Hz | TargetF={_num(target_f):.1f}Hz | R²={_num(r2_final):.4f}')  # 주파수/R² 출력
         print(f'  ModelValid={_bool_text(getattr(core, "last_model_valid", False))} | Reason={_safe_str(getattr(core, "last_reject_reason", "unknown"))}')  # 모델 유효성 출력
