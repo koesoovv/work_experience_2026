@@ -52,6 +52,8 @@ HEADER = [                                                         # v7: D/H 라
     'Cup_Volume_Ref_ml',                                            # [v5.33] 라벨 기준 용적(mL)
     'Label_Fill_Pct',                                               # [v5.33] 자동 라벨 = 급수량 ÷ 기준 용적 × 100
     'Label_Source',                                                 # [v5.33] measured_cup_volume / estimated_cup_volume / none
+    'Stop_Reason',                                                  # [v5.36] target / manual / safety_no_model / safety_max_time / safety_volume
+    'Half_Lock_Resets',                                             # [v5.36] 절반 주파수 고착 해제 횟수
 ]
 
 
@@ -284,6 +286,8 @@ def save_to_csv(                                                   # CSV 저장 
         _blank(label_ref_ml, 1),                                   # 라벨 기준 용적
         _blank(label_pct, 2),                                      # 자동 라벨
         label_src,                                                 # 라벨 출처
+        _safe_str(getattr(core, 'last_stop_reason', ''), 'unknown'),  # 정지 사유
+        int(_num(getattr(core, 'half_lock_resets', 0), 0)),        # 고착 해제 횟수
     ]
 
     try:                                                           # 저장 시도
@@ -296,6 +300,7 @@ def save_to_csv(                                                   # CSV 저장 
         print(f'\n[저장 완료] {filename}')                         # 저장 완료 출력
         print(f'  Trial_No={trial_no} | Cup={cup_type_text}')       # 실험 번호/컵 종류 출력
         print(f'  Target={target_pct:.1f}% | Actual={_blank(actual_fill_pct, 2)}% | Error={_blank(fill_error_pct, 2)}%')  # 오차 출력
+        print(f'  StopReason={_safe_str(getattr(core, "last_stop_reason", ""), "unknown")} | HalfLockResets={int(_num(getattr(core, "half_lock_resets", 0), 0))}')  # 정지 사유 출력
         print(f'  Label={_blank(label_pct, 2)}% ({label_src}) | Poured={poured_ml:.1f}mL / Ref={_blank(label_ref_ml, 1)}mL | Valve={valve_sec:.2f}s')  # 자동 라벨 출력
         print(f'  D_locked={_num(getattr(core, "last_d_locked_cm", 0.0)):.2f}cm | H_locked={_num(getattr(core, "last_init_air_locked_cm", init_air_len)):.2f}cm')  # 핵심 모델 출력
         print(f'  DecisionF={_num(decision_freq):.1f}Hz | RawF={_num(raw_stop_freq):.1f}Hz | TargetF={_num(target_f):.1f}Hz | R²={_num(r2_final):.4f}')  # 주파수/R² 출력

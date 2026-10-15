@@ -108,6 +108,8 @@ def run_kiosk_gui(on_ready=None):
         cup_top_d = _optional_float(cup_top_d_entry)
         cup_bottom_d = _optional_float(cup_bottom_d_entry)
         cup_vol = _optional_float(cup_volume_entry)                    # [v5.33] 실측 컵 용적(mL), 선택
+        # [v5.36] 실측 용적이 있으면 용적 기준 안전 정지에 사용 (입력칸 → cup_info.csv 등록값 순)
+        core.set_cup_reference_volume(cup_vol or exp_rec.get_cup_volume_ml(cup_name))
 
         core.ensure_audio_stream()
         core.start_filling_local()
@@ -120,7 +122,7 @@ def run_kiosk_gui(on_ready=None):
                 cup_top_diameter_cm=cup_top_d,
                 cup_bottom_diameter_cm=cup_bottom_d,
                 cup_volume_ml=cup_vol,
-                code_version='v5.33-vol-round-label+exp-rec',
+                code_version='v5.36-safety-stop+exp-rec',
                 sample_interval_sec=0.20,
             )
             trial_var.set(f'Trial : {trial_id}')
@@ -698,7 +700,13 @@ def run_kiosk_gui(on_ready=None):
                     _pending_save[0] = {'trial_id': finished_trial, 'init_air': init_air_save}
                     actual_air_entry.delete(0, 'end')
                     actual_air_frame.pack(side='right')                # 실측값 입력은 선택 사항
-                set_status(f'측정 완료 → 자동 라벨 {label_txt} 저장 (실측값 입력은 선택)')
+                stop_reason = str(getattr(core, 'last_stop_reason', '') or '')
+                if stop_reason.startswith('safety'):
+                    reason_txt = {'safety_no_model': '모델 미확정', 'safety_max_time': '최대 급수 시간 초과',
+                                  'safety_volume': '실측 용적 기준 초과'}.get(stop_reason, stop_reason)
+                    set_status(f'⚠ 안전 정지({reason_txt}) → 라벨 {label_txt} 저장, 데이터 확인 필요')
+                else:
+                    set_status(f'측정 완료 → 자동 라벨 {label_txt} 저장 (실측값 입력은 선택)')
 
                 _init_air_fixed[0] = None
                 init_air_var.set('초기 공기층(용기 높이) : - cm')

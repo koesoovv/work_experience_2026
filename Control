@@ -1,4 +1,13 @@
-# smart_water_core.py  ── v5.35-half-lock-escape
+# smart_water_core.py  ── v5.36-safety-stop
+#
+# [v5.36-SAFETY] 안전 정지 + 정지 사유 기록
+#   모델이 틀리거나 확정되지 않으면 사람이 끄기 전까지 급수가 계속됨(장비 Trial 2: 250mL 비커에 270mL,
+#   v5.32 실패 6회 모두 수동 정지 16.6~26.5s). 오디오와 독립된 스레드에서 0.2s마다 검사:
+#     ① 모델 미확정: MODEL_DEADLINE_SEC(25s) 내 H 미확정 → 정지 (정상 494회 H 확정 최대 18.47s)
+#     ② 최대 급수 시간: MAX_FILL_SEC(40s) 초과 → 정지 (정상 494회 정지 최대 26.6s)
+#     ③ 실측 용적 기준: cup_ref_volume_ml(R&D GUI 실측용적)이 있으면 급수량(Q·t)이
+#        min(SAFETY_VOLUME_MAX_RATIO, 목표 + SAFETY_VOLUME_MARGIN) × 용적에 도달 시 정지 (넘침 방지 보조)
+#   정지 사유 last_stop_reason: target / manual / safety_no_model / safety_max_time / safety_volume
 #
 # [v5.35-HALF-LOCK] 추적 주파수가 실제 공명의 절반에 고착되는 문제 해제
 #   증상: raw가 실제 공명의 1/2에 머물며 천천히만 오름 → 초기 주파수도 절반으로 확정 → H 과대(16cm)
@@ -135,6 +144,15 @@ HALF_LOCK_WINDOW_SEC    = 1.0    # 판정 창(s)
 HALF_LOCK_MIN_CHUNKS    = 6      # 판정에 필요한 최소 청크 수(≈0.56s)
 HALF_LOCK_RATIO         = 0.6    # 창 안에서 '추적값의 1.8~2.2배' 검출 비율이 이 이상이면 고착으로 판단
 HALF_LOCK_MAX_RESETS    = 2      # 급수 1회당 최대 재설정 횟수(진동 방지)
+
+# ── [v5.36-SAFETY] 안전 정지 ─────────────────────────────────────────
+MODEL_DEADLINE_SEC       = 25.0   # 이 시간까지 H 미확정이면 정지(s). 정상 494회 확정 최대 18.47s,
+                                  # 소음 대역 통과로 확정이 늦어지는 경우(시뮬레이션 20~25s) 여유 포함
+MAX_FILL_SEC             = 40.0   # 최대 급수 시간(s) = 15mL/s 기준 600mL. 정상 494회 정지 최대 26.6s.
+                                  # 600mL보다 큰 컵을 90% 이상 채울 때는 늘릴 것
+SAFETY_VOLUME_MARGIN     = 0.15   # 실측 용적 기준 정지: 목표 + 15%p
+SAFETY_VOLUME_MAX_RATIO  = 0.98   # 실측 용적 기준 정지 상한(가장자리 98%)
+SAFETY_CHECK_INTERVAL    = 0.2    # 안전 검사 주기(s)
 
 # ── [v5.33-VALVE-LABEL] 자동 라벨 ─────────────────────────────────────
 VALVE_DEAD_TIME_SEC     = 0.0    # 밸브 열림→출수 지연(s). 미측정이라 0, 실측 후 입력
@@ -357,6 +375,8 @@ round_d_cm              = []         # [v5.33-ROUNDS] 라운드별 D
 round_h_cm              = []         # [v5.33-ROUNDS] 라운드별 H
 round_t_sec             = []         # [v5.33-ROUNDS] 라운드별 확정 시각(filling_elapsed)
 last_stop_elapsed_sec   = 0.0
+last_stop_reason        = ''         # [v5.36-SAFETY] target / manual / safety_*
+cup_ref_volume_ml       = 0.0        # [v5.36-SAFETY] 실측 컵 용적(mL). GUI가 급수 시작 전에 설정, 0이면 미사용
 last_raw_stop_freq      = 0.0
 last_decision_freq      = 0.0
 last_decision_fill_pct  = 0.0
@@ -1099,6 +1119,64 @@ _reg_worker_thread.start()
 
 
 # ════════════════════════════════════════════════════════════════════
+#  [v5.36-SAFETY] 안전 정지 (오디오 콜백과 독립)
+# ════════════════════════════════════════════════════════════════════
+def set_cup_reference_volume(volume_ml) -> None:
+    """실측 컵 용적(mL)을 설정한다. None/0/잘못된 값이면 용적 기준 안전 정지를 쓰지 않는다."""
+    global cup_ref_volume_ml
+    try:
+        volume_ml = float(volume_ml)
+    except (TypeError, ValueError):
+        volume_ml = 0.0
+    cup_ref_volume_ml = volume_ml if volume_ml > 0 else 0.0
+
+
+def _safety_check() -> str:
+    """안전 정지 조건을 1회 검사한다. 정지했으면 사유, 아니면 빈 문자열을 반환한다."""
+    global is_filling, request_finish, history_freq_snapshot, last_stop_elapsed_sec, last_stop_reason
+    poured = poured_volume_ml()
+    with lock:
+        if not is_filling:
+            return ''
+        elapsed  = time.time() - filling_start_time - NOISE_CALIBRATION_TIME
+        no_model = init_air_len_cm <= 0
+        reason   = ''
+        if elapsed >= MAX_FILL_SEC:
+            reason = 'safety_max_time'
+        elif elapsed >= MODEL_DEADLINE_SEC and no_model:
+            reason = 'safety_no_model'
+        elif cup_ref_volume_ml > 0:
+            limit_ratio = min(SAFETY_VOLUME_MAX_RATIO, TARGET_FILL_PCT / 100.0 + SAFETY_VOLUME_MARGIN)
+            if poured >= cup_ref_volume_ml * limit_ratio:
+                reason = 'safety_volume'
+        if not reason:
+            return ''
+        last_stop_reason      = reason
+        history_freq_snapshot = list(history_freq)
+        last_stop_elapsed_sec = max(0.0, elapsed)
+        is_filling     = False
+        request_finish = True
+    solenoid_off_async()
+    close_audio_stream_async(delay_sec=0.35)
+    print(f'\n[⚠ 안전 정지] 사유={reason} | t={elapsed:.1f}s | 급수량≈{poured:.0f}mL'
+          f' | 모델={"미확정" if no_model else "확정"}', flush=True)
+    return reason
+
+
+def _safety_worker():
+    while True:
+        time.sleep(SAFETY_CHECK_INTERVAL)
+        try:
+            _safety_check()
+        except Exception as e:
+            print(f'\n[SAFETY_ERROR] {type(e).__name__}: {e}', flush=True)
+
+
+_safety_thread = threading.Thread(target=_safety_worker, daemon=True)
+_safety_thread.start()
+
+
+# ════════════════════════════════════════════════════════════════════
 #  급수 시작/종료
 # ════════════════════════════════════════════════════════════════════
 def start_filling_local() -> None:
@@ -1121,6 +1199,7 @@ def start_filling_local() -> None:
     global peak_lock_floor, init_stable_buffer
     global dynamic_Q, _f_stop_ema
     global last_stop_elapsed_sec, last_raw_stop_freq, last_decision_freq, last_decision_fill_pct
+    global last_stop_reason
     global last_detected_f, last_f_for_stop, last_ctrl_f
     global cup_volume_ml, last_fill_volume_ml, valve_open_time, valve_close_time
     global est_round, round_d_cm, round_h_cm, round_t_sec
@@ -1138,6 +1217,7 @@ def start_filling_local() -> None:
         freq_buffer             = deque()
         _f_stop_ema             = 0.0    # [v5.29-ASYM-EMA]
         last_stop_elapsed_sec   = 0.0
+        last_stop_reason        = ''
         last_raw_stop_freq      = 0.0
         last_decision_freq      = 0.0
         last_decision_fill_pct  = 0.0
@@ -1223,8 +1303,10 @@ def start_filling_local() -> None:
 
 def stop_filling_local(save_result: bool) -> None:
     global is_filling, request_finish, history_freq_snapshot
-    global last_stop_elapsed_sec
+    global last_stop_elapsed_sec, last_stop_reason
     with lock:
+        if is_filling and not last_stop_reason:                 # [v5.36] 급수 중 외부 정지 = 수동
+            last_stop_reason = 'manual'
         history_freq_snapshot = list(history_freq)
         last_stop_elapsed_sec = max(0.0, time.time() - filling_start_time - NOISE_CALIBRATION_TIME)
         is_filling = False
@@ -1252,6 +1334,7 @@ def audio_callback(indata, frames, time_info, status):
     global peak_lock_floor
     global _f_stop_ema
     global last_stop_elapsed_sec, last_raw_stop_freq, last_decision_freq, last_decision_fill_pct
+    global last_stop_reason
     global last_detected_f, last_f_for_stop
     global last_model_valid, last_reject_reason, last_control_profile
     global _stag_last_log
@@ -1862,6 +1945,8 @@ def audio_callback(indata, frames, time_info, status):
                       f' | L:{current_air:.2f}cm')
                 solenoid_off_async()
                 with lock:
+                    if is_filling:                               # [v5.36] 안전 정지가 먼저 했으면 사유 유지
+                        last_stop_reason = 'target'
                     history_freq_snapshot = list(history_freq)
                     last_stop_elapsed_sec = filling_elapsed
                     is_filling     = False

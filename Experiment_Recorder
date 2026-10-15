@@ -31,7 +31,7 @@ COUNTER_FILE = DATA_ROOT / "trial_counter.txt"
 TIMESERIES_DIR = DATA_ROOT / "timeseries"
 
 DEFAULT_SAMPLE_INTERVAL_SEC = 0.20
-DEFAULT_CODE_VERSION = "v5.33-vol-round-label"
+DEFAULT_CODE_VERSION = "v5.36-safety-stop"
 
 TIMESERIES_HEADER = [
     "Trial_ID", "Sample_Index", "Record_Elapsed_Sec", "Core_Elapsed_Sec",
@@ -69,6 +69,7 @@ SUMMARY_HEADER = [
     "Est_Rounds", "D_R1_cm", "H_R1_cm", "D_R2_cm", "H_R2_cm", "D_R3_cm", "H_R3_cm",
     "Valve_Open_Sec", "Poured_Volume_ml", "Cup_Volume_Ref_ml",
     "Label_Fill_Pct", "Label_Source",
+    "Stop_Reason", "Half_Lock_Resets",
 ]
 
 CUP_INFO_HEADER = [
@@ -442,6 +443,8 @@ def _snapshot_summary(core: Any) -> Dict[str, Any]:
             **_round_columns(list(_get(core, "round_d_cm", [])), list(_get(core, "round_h_cm", []))),
             "Valve_Open_Sec": round(core.get_valve_open_sec(), 3),
             "Poured_Volume_ml": round(core.poured_volume_ml(), 2),
+            "Stop_Reason": str(_get(core, "last_stop_reason", "") or "unknown"),
+            "Half_Lock_Resets": int(_safe_float(_get(core, "half_lock_resets", 0), 0) or 0),
         }
 
     core_lock = getattr(core, "lock", None)
