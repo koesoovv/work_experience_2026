@@ -1,4 +1,22 @@
-# smart_water_core.py  ── v5.32-time-q-bridge
+# smart_water_core.py  ── v5.40-track-filter
+#
+# [v5.40-TRACK] 6초 가드(SPLASH_GUARD) 대신 물리 기반 '트랙 필터'로 쓰레기 주파수만 거른다
+#   기존: 물이 나오기 시작한 뒤 6초 동안 검출을 막고(가드), 그 뒤에도 튀는 값을 여러 단계로 눌러 막음
+#         → 실제 수위 약 40~50%가 되어서야 데이터가 안정됨.
+#   변경: 컵 공명은 물이 차는 동안 음향 길이 ℓ = c/(4f) 가 일정 속도로 줄어드는 직선을 그린다
+#         (원통: dℓ/dt = -Q/A, Q=15mL/s·지름 3~15cm → 0.08~2.0 cm/s).
+#     ① 후보: 청크마다 FFT 피크 상위 TRACK_CAND_TOPK개(포물선 보간으로 주파수 보정)
+#     ② 트랙 확정: 최근 후보들로 RANSAC(쌍마다 직선 → 물리 기울기 범위 안에서 가장 많은 청크를 지나는 직선)
+#        주파수 고정 소음(펌프 등)은 기울기≈0이라 탈락, 흩어진 튐은 직선에 안 맞아 탈락.
+#        3배음·1/2 직선을 잡았으면 기본 공명 직선으로 교체(컵은 홀수 배음만 생김).
+#        트랙은 TRACK_CONFIRM_CHUNKS 동안 배음 확인을 통과한 뒤에만 하류로 출력하고, 트랙이 바뀌면
+#        하류 평활 상태(바닥값·EMA·버퍼)와 그 데이터로 만든 D/H 모델을 새 값으로 재설정한다.
+#     ③ 추적: 칼만 필터(상태 ℓ, dℓ/dt)로 예측, 예측 불확실성에 맞춘 게이트(3σ) 안의 후보만 채택,
+#        나머지는 버림(쓰레기). 1.2초 채택이 없으면 재탐색. 트랙 확정 시 기울기는 Theil–Sen(쌍별 기울기 중앙값).
+#     ④ 초기 주파수: 트랙 직선을 INIT_REF_TIME(6.85s)에서 읽음 — 기존 H 보정값(INIT_OFFSET_*)이
+#        맞춰진 시각과 같게 유지. 확정 시 그 전까지 채택된 데이터를 D 회귀에 바로 넣음(D/H 확정이 빨라짐).
+#     ⑤ 안전장치: TRACK_FALLBACK_SEC까지 트랙을 못 잡거나, 잃은 뒤 TRACK_REACQUIRE_SEC 동안 못 찾으면
+#        기존(v5.32) 검출 방식으로 자동 전환.
 #
 # [v5.32-TIME-Q-BRIDGE] 70% 이후 시간/유량 예측 브릿지 추가
 #   80~90% 고수위 목표에서 주파수 검출이 1800~2000Hz 부근에서 정체될 때,
@@ -194,6 +212,46 @@ TRACKING_FLOOR_RATIO    = 0.90
 EARLY_NOISE_SEC = 6.0
 EARLY_BUF_SIZE  = 9
 MONO_DROP_RATIO = 0.85
+
+# ── [v5.40-TRACK] 물리 기반 주파수 트랙 필터 ───────────────────────────
+TRACK_ENABLE            = True   # False면 기존(v5.32) 방식 그대로
+WATER_SETTLE_SEC        = 0.5    # 밸브가 열린 뒤 물이 컵에 닿기 전 구간(s): 이 이후부터 주파수 수집
+TRACK_CAND_TOPK         = 8      # 청크당 후보 피크 수
+TRACK_CAND_PROM         = 3.0    # 후보 피크 돌출도 ≥ 대역 중앙값 × 이 값
+TRACK_SLOPE_MIN_CM_S    = 0.08   # |dℓ/dt| 하한(cm/s): Q=15mL/s에서 지름 ≈15cm 컵
+TRACK_SLOPE_MAX_CM_S    = 2.0    # |dℓ/dt| 상한(cm/s): Q=15mL/s에서 지름 ≈3cm 컵
+TRACK_BOOT_GATE_CM      = 0.05   # 트랙 탐색 시 직선 인정 폭 하한(ℓ, cm). 고주파(ℓ 작음)에서 폭이 과해지지 않게 작게
+TRACK_BOOT_GATE_REL     = 0.03   # 트랙 탐색 시 직선 인정 상대 폭(ℓ의 3% ≈ 주파수 3%)
+TRACK_MEAS_SIGMA_CM     = 0.03   # 칼만: 측정 잡음 표준편차 하한(ℓ, cm)
+TRACK_MEAS_SIGMA_REL    = 0.012  # 칼만: 측정 잡음 상대값(ℓ의 1.2% ≈ 주파수 1.2%)
+TRACK_ACCEL_NOISE       = 0.02   # 칼만: 기울기 변화(테이퍼 컵) 허용 정도(cm²/s³)
+TRACK_GATE_SIGMA        = 3.0    # 칼만: 채택 게이트 = 3σ(예측 불확실성 + 측정 잡음)
+TRACK_GATE_MIN_REL      = 0.02   # 채택 게이트 최소 폭(ℓ의 2%)
+TRACK_GATE_MAX_REL      = 0.10   # 채택 게이트 최대 폭(ℓ의 10%)
+TRACK_RATE_WINDOW       = 20     # 추적 채택률을 보는 최근 청크 수
+TRACK_MIN_ACCEPT_RATE   = 0.5    # 최근 채택률이 이보다 낮으면 가짜 트랙으로 보고 재탐색(진짜 트랙은 시뮬레이션 90%+)
+TRACK_BOOT_WINDOW_SEC   = 2.0    # 트랙 탐색에 쓰는 최근 후보 구간(s)
+TRACK_MIN_SPAN_SEC      = 1.0    # 트랙 확정에 필요한 최소 시간 폭(s)
+TRACK_MIN_PAIR_DT       = 0.3    # 직선 후보를 만들 두 점의 최소 시간 간격(s)
+TRACK_MIN_INLIER_CHUNKS = 10     # 트랙 확정에 필요한 최소 청크 수
+TRACK_MIN_COVERAGE      = 0.7    # 탐색 구간 청크 중 직선에 맞는 비율 하한(실제 공명은 대부분 청크에 존재)
+TRACK_MAX_PAIRS         = 4000   # 직선 후보 최대 개수(계산량 제한)
+# 배음 확인: 채택 주파수 f의 같은 청크에 f/3(→3배음을 잡은 것) 또는 2f(→1/2을 잡은 것)가 충분히 있으면
+#           기본 공명으로 교체(컵 공명은 f, 3f, 5f만 생김)
+TRACK_HARM3_TOL         = 0.05   # f/3 판정 허용 오차: 측정 주파수 흔들림(1~3%) 감안
+TRACK_HARM3_SUPPORT     = 0.5    # f/3 판정 비율. f≤900Hz면 f/3<300Hz(탐색 하한)라 정상 트랙의 우연 일치 없음
+TRACK_HARM2_TOL         = 0.03   # 2f 판정 허용 오차: 2f 자리는 다른 피크와 우연히 겹치기 쉬워 엄격하게
+TRACK_HARM2_SUPPORT     = 0.6    # 2f 판정 비율
+TRACK_HARM_SLOPE_TOL    = 0.5    # 배음 후보의 ℓ 기울기가 기대값(f/3: ×3, 2f: ×0.5)의 ±50% 안이어야 함
+                                 # (주파수 고정 소음이 우연히 f/3·2f 자리에 겹친 경우를 배제)
+TRACK_FLAT_SEC          = 2.0    # 칼만 기울기가 물리 하한보다 평평한 상태가 이 시간 지속되면 고정 소음 추적으로 보고 재탐색
+TRACK_HARMONIC_WINDOW   = 15     # 추적 중 배음 관계를 보는 최근 채택 청크 수
+TRACK_CONFIRM_CHUNKS    = 15     # 트랙 확정 후 이 수만큼 채택(배음 확인 통과)되어야 하류(평활·제어)로 출력
+TRACK_LOST_SEC          = 1.2    # 이 시간 동안 채택이 없으면 트랙 재탐색(s)
+TRACK_FALLBACK_SEC      = 6.0    # 이 시각까지 트랙을 한 번도 못 잡으면 기존 방식으로 전환(s)
+TRACK_REACQUIRE_SEC     = 3.0    # 트랙을 잃은 뒤 이 시간 안에 못 찾으면 기존 방식으로 전환(s)
+TRACK_LOG_INTERVAL      = 2.0    # 채택/거부 통계 출력 간격(s)
+INIT_REF_TIME           = 6.85   # 초기 주파수 기준 시각(s): 실험 494회 모두 6.85±0.01s에 확정 → H 보정값 기준
 
 # ── EMA alpha (구간 밖 fallback) ─────────────────────────────────────
 EMA_ALPHA_NORMAL    = 0.35
@@ -591,6 +649,429 @@ def get_frequency(chunk, last_freq, f_min, f_max):
 
 
 # ════════════════════════════════════════════════════════════════════
+#  [v5.40-TRACK] 물리 기반 주파수 트랙 필터
+# ════════════════════════════════════════════════════════════════════
+class _FreqTrack:
+    """ℓ = c/(4f) 영역에서 '물이 차며 일정하게 줄어드는 직선'을 찾고, 칼만 필터로 추적하며 맞는 후보만 채택한다."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.cand          = deque()            # (t, 후보 주파수 배열)
+        self.active        = False              # 트랙 추적 중
+        self.established   = False              # 한 번이라도 확정됨
+        self.fallback      = False              # 기존 방식으로 전환됨
+        self.x             = np.zeros(2)        # 칼만 상태 [ℓ(cm), dℓ/dt(cm/s)] @ self.tx
+        self.P             = np.eye(2)          # 칼만 공분산
+        self.tx            = 0.0                # 상태 기준 시각
+        self.hist          = []                 # 전체 채택 (t, f)
+        self.last_accept_t = 0.0
+        self.lost_since    = 0.0
+        self.n_acc         = 0
+        self.n_rej         = 0
+        self.last_log_t    = 0.0
+        self.splash_noise  = []                 # 가드 구간 소음 피크(기존 방식 전환 시에만 등록)
+        self.harm          = deque(maxlen=TRACK_HARMONIC_WINDOW)   # (t, f/3 후보 ℓ 또는 None, 2f 후보 ℓ 또는 None)
+        self.flat_since    = None               # 칼만 기울기가 물리 하한보다 평평해진 시각
+        self.rate          = deque(maxlen=TRACK_RATE_WINDOW)   # 최근 청크 채택 여부
+        self.confirmed     = False              # 하류로 출력 중
+        self.n_since       = 0                  # (재)확정·배음 이동 이후 채택 수
+        self.reanchor_pending = False           # 다음 출력 때 하류 상태 재설정 필요
+
+    def predict(self, t: float) -> float:
+        """시각 t의 ℓ 예측(cm). 과거 시각(초기 주파수 기준 시각 등)도 같은 직선으로 계산."""
+        return float(self.x[0] + self.x[1] * (t - self.tx))
+
+    def _propagate(self, t: float):
+        dt = t - self.tx
+        F  = np.array([[1.0, dt], [0.0, 1.0]])
+        q  = TRACK_ACCEL_NOISE * abs(dt)
+        Qn = q * np.array([[dt * dt / 3.0, dt / 2.0], [dt / 2.0, 1.0]])
+        return F @ self.x, F @ self.P @ F.T + Qn
+
+    @staticmethod
+    def meas_var(l_cm: float) -> float:
+        return max(TRACK_MEAS_SIGMA_CM, TRACK_MEAS_SIGMA_REL * l_cm) ** 2
+
+
+_track = _FreqTrack()
+
+
+def _track_candidates(chunk) -> np.ndarray:
+    """청크의 FFT 피크 상위 TRACK_CAND_TOPK개(Hz). 포물선 보간으로 bin(≈10.8Hz)보다 정밀하게 추정."""
+    filtered = signal.sosfilt(HP_SOS, chunk.astype(float))
+    mag   = np.abs(np.fft.rfft(filtered * np.hamming(len(filtered)))) + 1e-12
+    lo    = int(np.ceil(FREQ_MIN_LIMIT * len(filtered) / SAMPLE_RATE))
+    hi    = int(np.floor(FREQ_MAX_LIMIT * len(filtered) / SAMPLE_RATE))
+    band  = mag[lo:hi]
+    if band.size < 5:
+        return np.empty(0)
+    peaks, _ = signal.find_peaks(band, prominence=float(np.median(band)) * TRACK_CAND_PROM, distance=2)
+    if len(peaks) == 0:
+        return np.empty(0)
+    peaks = peaks[np.argsort(band[peaks])[::-1][:TRACK_CAND_TOPK]]
+    logm  = np.log(mag)
+    out   = []
+    for p in peaks:
+        k = lo + int(p)
+        den   = logm[k - 1] - 2.0 * logm[k] + logm[k + 1]
+        delta = 0.5 * (logm[k - 1] - logm[k + 1]) / den if abs(den) > 1e-12 else 0.0
+        f = (k + max(-0.5, min(0.5, delta))) * SAMPLE_RATE / len(filtered)
+        if not any(abs(f - nf) < 25.0 for nf in noise_profile):
+            out.append(f)
+    return np.array(out, dtype=float)
+
+
+def _track_line_support(T, L, C, a, b):
+    """직선 ℓ=a+b·t 의 탐색 게이트 안에 후보가 있는 청크 수와, 청크별 가장 가까운 후보 인덱스."""
+    gate = np.maximum(TRACK_BOOT_GATE_CM, TRACK_BOOT_GATE_REL * L)
+    res  = np.abs(L - (a + b * T))
+    best = {}
+    for i in np.flatnonzero(res <= gate):
+        c = int(C[i])
+        if c not in best or res[i] < res[best[c]]:
+            best[c] = i
+    return len(best), np.array(sorted(best.values()), dtype=int)
+
+
+def _theil_sen(T, L):
+    """Theil–Sen 직선(쌍별 기울기의 중앙값). 반환 (a, b): ℓ = a + b·t"""
+    ii, jj = np.triu_indices(len(T), 1)
+    dt = T[jj] - T[ii]
+    ok = dt > 1e-6
+    if not np.any(ok):
+        return float(np.median(L)), 0.0
+    b = float(np.median((L[jj][ok] - L[ii][ok]) / dt[ok]))
+    a = float(np.median(L - b * T))
+    return a, b
+
+
+def _track_bootstrap(tr: _FreqTrack, t_now: float) -> bool:
+    """최근 후보에서 물리 기울기 범위 안의 직선을 RANSAC(쌍 → 직선 → 지지 청크 수)으로 찾는다."""
+    window = [(t, fs) for (t, fs) in tr.cand if t >= t_now - TRACK_BOOT_WINDOW_SEC]
+    n_chunks = len(window)
+    rows = [(i, t, f) for i, (t, fs) in enumerate(window) for f in fs]
+    if n_chunks < TRACK_MIN_INLIER_CHUNKS or len(rows) < TRACK_MIN_INLIER_CHUNKS:
+        return False
+    if window[-1][0] - window[0][0] < TRACK_MIN_SPAN_SEC:
+        return False
+    C = np.array([r[0] for r in rows], dtype=int)
+    T = np.array([r[1] for r in rows], dtype=float)
+    L = SOUND_SPEED / (4.0 * np.array([r[2] for r in rows], dtype=float))
+
+    ii, jj = np.triu_indices(len(T), 1)
+    keep = (T[jj] - T[ii]) >= TRACK_MIN_PAIR_DT
+    ii, jj = ii[keep], jj[keep]
+    if len(ii) == 0:
+        return False
+    slope = (L[jj] - L[ii]) / (T[jj] - T[ii])
+    keep  = (slope <= -TRACK_SLOPE_MIN_CM_S) & (slope >= -TRACK_SLOPE_MAX_CM_S)
+    ii, slope = ii[keep], slope[keep]
+    if len(slope) == 0:
+        return False
+    if len(slope) > TRACK_MAX_PAIRS:                              # 결정적 표본 추출(재현성)
+        sel = np.random.default_rng(len(slope)).choice(len(slope), TRACK_MAX_PAIRS, replace=False)
+        ii, slope = ii[sel], slope[sel]
+    inter = L[ii] - slope * T[ii]
+
+    gate = np.maximum(TRACK_BOOT_GATE_CM, TRACK_BOOT_GATE_REL * L)
+    inl  = np.abs(L[None, :] - (inter[:, None] + slope[:, None] * T[None, :])) <= gate[None, :]
+    support = np.zeros(len(slope), dtype=int)
+    for c in range(n_chunks):
+        cols = (C == c)
+        if np.any(cols):
+            support += inl[:, cols].any(axis=1)
+    k = int(np.argmax(support))
+    n_sup, idx = _track_line_support(T, L, C, inter[k], slope[k])
+    if n_sup < TRACK_MIN_INLIER_CHUNKS or n_sup < TRACK_MIN_COVERAGE * n_chunks:
+        return False
+    a, b = _theil_sen(T[idx], L[idx])
+
+    # 배음 확인(청크별): 채택점 f의 같은 청크에 f/3 또는 2f 후보가 충분히 있으면 그쪽이 기본 공명
+    F = SOUND_SPEED / (4.0 * L)
+    for _ in range(3):
+        switched = False
+        for ratio, name, tol, need in ((1.0 / 3.0, '3배음', TRACK_HARM3_TOL, TRACK_HARM3_SUPPORT),
+                                       (2.0, '1/2 주파수', TRACK_HARM2_TOL, TRACK_HARM2_SUPPORT)):
+            hp = []
+            for i in idx:
+                same = np.flatnonzero(C == C[i])
+                rel  = np.abs(F[same] / (F[i] * ratio) - 1.0)
+                if rel.size and rel.min() <= tol:
+                    hp.append(int(same[np.argmin(rel)]))
+            if len(hp) >= TRACK_MIN_INLIER_CHUNKS and len(hp) >= need * n_sup:
+                hp = np.array(hp, dtype=int)
+                a2, b2 = _theil_sen(T[hp], L[hp])
+                if not (TRACK_SLOPE_MIN_CM_S <= -b2 <= TRACK_SLOPE_MAX_CM_S):
+                    continue
+                n2, idx2 = _track_line_support(T, L, C, a2, b2)
+                if n2 < TRACK_MIN_INLIER_CHUNKS:
+                    continue
+                a, b, n_sup, idx = a2, b2, n2, idx2
+                print(f'\n[트랙] {name} 직선을 잡아 기본 공명 직선으로 교체 (배음 관계 {len(hp)}청크)')
+                switched = True
+                break
+        if not switched:
+            break
+    # 최종 직선 근처 후보로 한 번 더 강건 재적합
+    n_sup, idx = _track_line_support(T, L, C, a, b)
+    if n_sup < TRACK_MIN_INLIER_CHUNKS:
+        return False
+    a, b = _theil_sen(T[idx], L[idx])
+    if not (TRACK_SLOPE_MIN_CM_S <= -b <= TRACK_SLOPE_MAX_CM_S):
+        return False
+
+    resid  = L[idx] - (a + b * T[idx])
+    sig_l  = max(TRACK_MEAS_SIGMA_CM, float(1.4826 * np.median(np.abs(resid - np.median(resid)))))
+    span   = float(T[idx].max() - T[idx].min())
+    sig_v  = max(0.05, 2.0 * sig_l / max(span, 0.5))               # 기울기 불확실성(짧은 구간일수록 큼)
+    tr.tx  = float(T[idx].max())
+    tr.x   = np.array([a + b * tr.tx, b])
+    tr.P   = np.diag([sig_l ** 2, sig_v ** 2])
+    tr.hist = []                                                  # 이전(잃은) 트랙 기록은 신뢰하지 않음
+    tr.harm.clear()
+    tr.flat_since = None
+    tr.rate.clear()
+    tr.confirmed, tr.n_since, tr.reanchor_pending = False, 0, True
+    for i in idx:
+        tr.hist.append((float(T[i]), float(SOUND_SPEED / (4.0 * L[i]))))
+    tr.hist.sort()
+    tr.active, tr.established = True, True
+    tr.last_accept_t = tr.tx
+    area = FLOW_RATE / abs(b)
+    print(f'\n[트랙 확정] t={t_now:.1f}s | dℓ/dt={b:.3f}±{sig_v:.2f}cm/s (지름≈{np.sqrt(4 * area / np.pi):.1f}cm 상당)'
+          f' | 지지 {n_sup}/{n_chunks}청크 | f≈{SOUND_SPEED / (4 * tr.predict(t_now)):.0f}Hz')
+    return True
+
+
+def _downstream_reanchor(f_new: float, t: float) -> None:
+    """
+    트랙이 (재)확정되거나 기본 공명으로 옮겨진 뒤 첫 출력 시, 하류 평활 상태를 새 주파수로 재설정한다.
+    이전 값으로 걸린 바닥값(peak_lock_floor·max_freq_seen)·비대칭 EMA(f_for_stop)·중앙값 버퍼가
+    새 트랙을 끌어내리거나 끌어올리지 않게 한다. 이전 값으로 이미 만든 D/H 모델이 있으면 함께 초기화.
+    """
+    global last_tracked_freq, last_stable_f, freq_buffer, _prev_buf_median, _freeze_count
+    global dynamic_min_limit, peak_lock_floor, max_freq_seen, _f_stop_ema
+    global tracking_mode, tracking_mode_hits
+    global initial_stable_freq, initial_stable_time, current_diameter, init_air_len_cm, _eff_target_air_cm
+    global calibration_done, target_freq, theory_slope, theory_intercept, theory_locked, dynamic_Q
+    global last_fill_pct, consecutive_stop_hits, last_model_valid, last_reject_reason
+    with lock:
+        prev = float(last_stable_f)
+        jumped = prev > 0 and abs(f_new / prev - 1.0) > 0.15
+        had_model = initial_stable_freq > 0 and jumped
+        last_tracked_freq  = f_new
+        last_stable_f      = f_new
+        freq_buffer        = deque([f_new])
+        _prev_buf_median   = 0.0
+        _freeze_count      = 0
+        dynamic_min_limit  = max(FREQ_MIN_LIMIT, f_new * 0.75)
+        peak_lock_floor    = f_new
+        max_freq_seen      = f_new
+        _f_stop_ema        = f_new
+        tracking_mode      = False
+        tracking_mode_hits = 0
+        if had_model:                                            # 잘못된 트랙 값으로 만든 모델 폐기 → 재추정
+            initial_stable_freq = 0.0
+            initial_stable_time = 0.0
+            init_stable_buffer.clear()
+            reg_time_buffer.clear()
+            reg_inv_freq_buffer.clear()
+            diameter_candidates.clear()
+            current_diameter   = 0.0
+            init_air_len_cm    = 0.0
+            _eff_target_air_cm = 3.0
+            calibration_done   = False
+            target_freq        = 0.0
+            theory_slope       = 0.0
+            theory_intercept   = 0.0
+            theory_locked      = False
+            dynamic_Q          = FLOW_RATE
+            last_fill_pct      = 0.0
+            consecutive_stop_hits = 0
+            last_model_valid   = False
+            last_reject_reason = 'track_reanchor'
+    if jumped:
+        print(f'\n[트랙] 하류 상태 재설정 {prev:.0f}→{f_new:.0f}Hz (t={t:.1f}s)'
+              + (' | 이전 D/H 모델 폐기 후 재추정' if had_model else ''))
+
+
+def _track_harmonic_watch(tr: _FreqTrack, cands: np.ndarray, f: float, t: float) -> None:
+    """
+    추적 중 채택 주파수 f의 f/3(또는 2f) 후보가 최근 청크 대부분에 있고, 그 후보들이 트랙과 같이
+    움직이면(ℓ 기울기 = 트랙의 3배 또는 0.5배) 지금 트랙은 배음이므로 기본 공명으로 옮긴다.
+    """
+    def near(target, tol):
+        if not len(cands):
+            return None
+        rel = np.abs(cands / target - 1.0)
+        j = int(np.argmin(rel))
+        return float(SOUND_SPEED / (4.0 * cands[j])) if rel[j] <= tol else None
+
+    tr.harm.append((t, near(f / 3.0, TRACK_HARM3_TOL), near(f * 2.0, TRACK_HARM2_TOL)))
+    if len(tr.harm) < TRACK_HARMONIC_WINDOW:
+        return
+    b_trk = float(tr.x[1])
+    for col, need, slope_mult, scale, name in ((1, TRACK_HARM3_SUPPORT, 3.0, 3.0, '3배음'),
+                                               (2, TRACK_HARM2_SUPPORT, 0.5, 0.5, '1/2 주파수')):
+        pts = [(h[0], h[col]) for h in tr.harm if h[col] is not None]
+        if len(pts) < need * len(tr.harm) or len(pts) < 5:
+            continue
+        _, b_h = _theil_sen(np.array([p[0] for p in pts]), np.array([p[1] for p in pts]))
+        expect = b_trk * slope_mult
+        if not (TRACK_SLOPE_MIN_CM_S <= -b_h <= TRACK_SLOPE_MAX_CM_S):
+            continue                                             # 평평(고정 소음) 또는 비물리적 → 배음 아님
+        if abs(b_h / expect - 1.0) > TRACK_HARM_SLOPE_TOL:
+            continue                                             # 트랙과 같이 움직이지 않음 → 우연한 겹침
+        if not (TRACK_SLOPE_MIN_CM_S <= -b_trk * scale <= TRACK_SLOPE_MAX_CM_S):
+            continue
+        tr.x = tr.x * scale
+        tr.P = tr.P * scale * scale
+        tr.harm.clear()
+        tr.hist = [(th, fh / scale) for th, fh in tr.hist]       # 기록도 기본 공명 기준으로 환산
+        tr.confirmed, tr.n_since, tr.reanchor_pending = False, 0, True
+        print(f'\n[트랙] 추적 중 {name}를 따라가고 있음 → 기본 공명으로 이동 (t={t:.1f}s,'
+              f' f {f:.0f}→{f / scale:.0f}Hz, 배음 후보 기울기 {b_h:.3f} / 기대 {expect:.3f}cm/s)')
+        return
+
+
+def _track_step(chunk, t: float) -> float:
+    """청크 1개 처리. 트랙에 맞는 주파수(Hz)를 반환, 쓰레기·트랙 미확정이면 0.0."""
+    tr = _track
+    cands = _track_candidates(chunk)
+    tr.cand.append((t, cands))
+    while tr.cand and tr.cand[0][0] < t - TRACK_BOOT_WINDOW_SEC:
+        tr.cand.popleft()
+
+    if t - tr.last_log_t >= TRACK_LOG_INTERVAL:
+        state = '추적' if tr.active else ('재탐색' if tr.established else '탐색')
+        print(f'\n[트랙] t={t:.1f}s {state} | 채택 {tr.n_acc} / 거부 {tr.n_rej}'
+              + (f' | f̂={SOUND_SPEED / (4 * tr.predict(t)):.0f}Hz dℓ/dt={tr.x[1]:.3f}' if tr.active else ''))
+        tr.last_log_t = t
+
+    if not tr.active:
+        lost_too_long = tr.established and (t - tr.lost_since) > TRACK_REACQUIRE_SEC
+        if (not tr.established and t >= TRACK_FALLBACK_SEC) or lost_too_long:
+            tr.fallback = True
+            with lock:
+                for f_n in tr.splash_noise:                      # 기존 방식과 같게 가드 구간 소음 등록
+                    if not any(abs(f_n - nf) < 30 for nf in noise_profile):
+                        noise_profile.append(f_n)
+            print(f'\n[트랙] {"잃은 뒤 재확정 실패" if lost_too_long else "트랙 미확정"} → 기존(v5.32) 검출 방식으로 전환'
+                  f' (t={t:.1f}s)')
+            return 0.0
+        _track_bootstrap(tr, t)
+        return 0.0
+
+    # 칼만 예측 → 게이트 안 가장 가까운 후보 채택 → 갱신
+    x_p, P_p = tr._propagate(t)
+    l_hat    = float(x_p[0])
+    S        = float(P_p[0, 0]) + _FreqTrack.meas_var(l_hat)
+    g        = min(TRACK_GATE_MAX_REL * l_hat, max(TRACK_GATE_MIN_REL * l_hat, TRACK_GATE_SIGMA * np.sqrt(S)))
+    if len(cands) and l_hat > 0:
+        dist = np.abs(SOUND_SPEED / (4.0 * cands) - l_hat)
+        j = int(np.argmin(dist))
+        if dist[j] <= g:
+            f  = float(cands[j])
+            z  = SOUND_SPEED / (4.0 * f)
+            K  = P_p[:, 0] / S
+            tr.x  = x_p + K * (z - l_hat)
+            tr.P  = P_p - np.outer(K, P_p[0, :])
+            if -tr.x[1] < TRACK_SLOPE_MIN_CM_S:                    # 물리 하한보다 평평 = 고정 소음을 따라가는 중일 수 있음
+                tr.flat_since = t if tr.flat_since is None else tr.flat_since
+            else:
+                tr.flat_since = None
+            tr.x[1] = -min(TRACK_SLOPE_MAX_CM_S, max(TRACK_SLOPE_MIN_CM_S, -tr.x[1]))   # 물리 범위 유지
+            if tr.flat_since is not None and t - tr.flat_since >= TRACK_FLAT_SEC:
+                tr.active, tr.confirmed = False, False
+                tr.lost_since = t
+                print(f'\n[트랙] {TRACK_FLAT_SEC:.0f}s 넘게 주파수가 오르지 않음(고정 소음 추정) → 재탐색 (t={t:.1f}s)')
+                return 0.0
+            tr.tx = t
+            tr.hist.append((t, f))
+            tr.last_accept_t = t
+            tr.n_acc += 1
+            tr.rate.append(True)
+            tr.n_since += 1
+            _track_harmonic_watch(tr, cands, f, t)
+            if not tr.confirmed and tr.n_since >= TRACK_CONFIRM_CHUNKS:
+                tr.confirmed = True
+                print(f'\n[트랙] 기본 공명 확인 → 출력 시작 (t={t:.1f}s, f={f:.0f}Hz)')
+            if not tr.confirmed:
+                return 0.0
+            if tr.reanchor_pending:
+                tr.reanchor_pending = False
+                _downstream_reanchor(f, t)
+            return f
+    tr.n_rej += 1
+    tr.rate.append(False)
+    if len(tr.rate) >= TRACK_RATE_WINDOW and sum(tr.rate) / len(tr.rate) < TRACK_MIN_ACCEPT_RATE:
+        tr.active, tr.confirmed = False, False
+        tr.lost_since = t
+        print(f'\n[트랙] 최근 채택률 {sum(tr.rate) / len(tr.rate) * 100:.0f}% (<{TRACK_MIN_ACCEPT_RATE * 100:.0f}%) → 가짜 트랙으로 보고 재탐색 (t={t:.1f}s)')
+        return 0.0
+    if t - tr.last_accept_t > TRACK_LOST_SEC:
+        tr.active     = False
+        tr.confirmed  = False
+        tr.lost_since = t
+        print(f'\n[트랙] {TRACK_LOST_SEC:.1f}s 동안 맞는 주파수 없음 → 재탐색 (t={t:.1f}s)')
+    return 0.0
+
+
+def _detect_v532(chunk, filling_elapsed: float, _last: float, _init: float, _last_s: float) -> float:
+    """
+    [v5.40-TRACK] 기존(v5.32) 3·4단계 검출을 그대로 옮긴 함수. 트랙 필터를 못 쓸 때(전환 후) 사용.
+    반환: 검출 주파수(Hz), 범위 밖·실패면 0.0
+    """
+    global dynamic_min_limit
+
+    # ── 3단계: 탐색 범위 결정 ────────────────────────────────────
+    if filling_elapsed < 3.5:
+        current_ceil  = EARLY_CEIL_HZ
+        current_floor = dynamic_min_limit
+    elif tracking_mode:
+        current_ceil  = min(FREQ_MAX_LIMIT, _last + TRACKING_BAND_HZ)
+        current_floor = max(dynamic_min_limit, max_freq_seen * TRACKING_FLOOR_RATIO)
+    else:
+        base = _last if _last > 0 else (_last_s if _last_s > 0 else _init)
+        current_ceil  = min(FREQ_MAX_LIMIT, base + 1500.0) if base > 0 else FREQ_MAX_LIMIT
+        current_floor = dynamic_min_limit
+
+    if not tracking_mode and _last > 400:
+        new_floor = _last * 0.75
+        if new_floor > dynamic_min_limit:
+            dynamic_min_limit = new_floor
+
+    if _init > 0 and not tracking_mode:
+        init_floor = _init * 0.85
+        if init_floor > dynamic_min_limit:
+            dynamic_min_limit = init_floor
+
+    with lock:
+        _tf = float(target_freq)
+    if _tf > 0 and dynamic_min_limit > _tf * 0.85:
+        dynamic_min_limit = _tf * 0.85
+
+    # ── 4단계: 주파수 검출 ───────────────────────────────────────
+    with lock:
+        _init_confirmed = (initial_stable_freq > 0)
+
+    if not _init_confirmed:
+        filtered   = signal.sosfilt(HP_SOS, chunk.astype(float))
+        detected_f = fft_backup_frequency(filtered, _last, current_floor, current_ceil)
+        detected_f = _harmonic_correct(detected_f, _last)
+    else:
+        detected_f = get_frequency(chunk, _last, current_floor, current_ceil)
+
+    if detected_f < current_floor or detected_f == 0:
+        detected_f = 0.0
+    if filling_elapsed < 3.5 and detected_f > EARLY_CEIL_HZ:
+        detected_f = 0.0
+    return float(detected_f)
+
+
+# ════════════════════════════════════════════════════════════════════
 #  회귀 기반 D 추정
 # ════════════════════════════════════════════════════════════════════
 def robust_slope_loess_lsm(times, inv_freqs):
@@ -904,6 +1385,7 @@ def start_filling_local() -> None:
         bridge_start_freq       = 0.0
         bridge_eta_sec          = 0.0
         bridge_last_log         = 0.0
+        _track.reset()                                           # [v5.40-TRACK]
     print('\n>>> [1단계] 배경 소음 측정 (3초)...')
 
 
@@ -984,7 +1466,11 @@ def audio_callback(indata, frames, time_info, status):
 
         filling_elapsed = elapsed - NOISE_CALIBRATION_TIME
 
+        # [v5.40-TRACK] 트랙 필터 사용 여부 (전환 전까지)
+        track_on = TRACK_ENABLE and not _track.fallback
+
         # ── 2단계: SPLASH 구간 펌프 소음 보완 ──────────────────────
+        #   트랙 모드: 소음 피크는 따로 모아 두기만 하고(기존 방식 전환 시에만 등록), 검출은 계속한다.
         if filling_elapsed < SPLASH_GUARD_TIME:
             windowed = chunk * np.hamming(len(chunk))
             fft_val  = np.abs(np.fft.rfft(windowed))
@@ -993,12 +1479,14 @@ def audio_callback(indata, frames, time_info, status):
             if np.any(mask):
                 vf, vm   = freqs[mask], fft_val[mask]
                 peaks, _ = signal.find_peaks(vm, prominence=vm.max() * 0.3)
+                target_list = _track.splash_noise if track_on else noise_profile
                 with lock:
                     for p in peaks:
                         f_n = float(vf[p])
-                        if not any(abs(f_n - nf) < 30 for nf in noise_profile):
-                            noise_profile.append(f_n)
-            return
+                        if not any(abs(f_n - nf) < 30 for nf in target_list):
+                            target_list.append(f_n)
+            if not track_on or filling_elapsed < WATER_SETTLE_SEC:
+                return
 
         with lock:
             _last   = float(last_tracked_freq)
@@ -1017,48 +1505,11 @@ def audio_callback(indata, frames, time_info, status):
                 if peak_mag < _nfl * SNR_THRESHOLD:
                     return
 
-        # ── 3단계: 탐색 범위 결정 ────────────────────────────────────
-        if filling_elapsed < 3.5:
-            current_ceil  = EARLY_CEIL_HZ
-            current_floor = dynamic_min_limit
-        elif tracking_mode:
-            current_ceil  = min(FREQ_MAX_LIMIT, _last + TRACKING_BAND_HZ)
-            current_floor = max(dynamic_min_limit, max_freq_seen * TRACKING_FLOOR_RATIO)
+        # ── [v5.40-TRACK] 트랙 필터: 직선에 맞는 주파수만 채택, 나머지(쓰레기)는 0 ──
+        if track_on:
+            detected_f = _track_step(chunk, filling_elapsed)
         else:
-            base = _last if _last > 0 else (_last_s if _last_s > 0 else _init)
-            current_ceil  = min(FREQ_MAX_LIMIT, base + 1500.0) if base > 0 else FREQ_MAX_LIMIT
-            current_floor = dynamic_min_limit
-
-        if not tracking_mode and _last > 400:
-            new_floor = _last * 0.75
-            if new_floor > dynamic_min_limit:
-                dynamic_min_limit = new_floor
-
-        if _init > 0 and not tracking_mode:
-            init_floor = _init * 0.85
-            if init_floor > dynamic_min_limit:
-                dynamic_min_limit = init_floor
-
-        with lock:
-            _tf = float(target_freq)
-        if _tf > 0 and dynamic_min_limit > _tf * 0.85:
-            dynamic_min_limit = _tf * 0.85
-
-        # ── 4단계: 주파수 검출 ───────────────────────────────────────
-        with lock:
-            _init_confirmed = (initial_stable_freq > 0)
-
-        if not _init_confirmed:
-            filtered   = signal.sosfilt(HP_SOS, chunk.astype(float))
-            detected_f = fft_backup_frequency(filtered, _last, current_floor, current_ceil)
-            detected_f = _harmonic_correct(detected_f, _last)
-        else:
-            detected_f = get_frequency(chunk, _last, current_floor, current_ceil)
-
-        if detected_f < current_floor or detected_f == 0:
-            detected_f = 0.0
-        if filling_elapsed < 3.5 and detected_f > EARLY_CEIL_HZ:
-            detected_f = 0.0
+            detected_f = _detect_v532(chunk, filling_elapsed, _last, _init, _last_s)
 
         if detected_f == 0.0:
             consecutive_loss_count += 1
@@ -1217,7 +1668,8 @@ def audio_callback(indata, frames, time_info, status):
             last_stable_f   = stable_f
             last_detected_f = raw_f_for_reg
             last_f_for_stop = f_for_stop_plot
-            if (filling_elapsed > SPLASH_GUARD_TIME
+            if (not track_on
+                    and filling_elapsed > SPLASH_GUARD_TIME
                     and initial_stable_freq == 0
                     and stable_f > INIT_STABLE_MIN_HZ):
                 init_stable_buffer.append(stable_f)
@@ -1225,6 +1677,25 @@ def audio_callback(indata, frames, time_info, status):
                     initial_stable_freq = float(np.percentile(list(init_stable_buffer), 85))
                     initial_stable_time = float(filling_elapsed)
                     print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz | t={initial_stable_time:.1f}s')
+            # [v5.40-TRACK] 트랙 직선을 INIT_REF_TIME(6.85s)에서 읽어 초기 주파수 확정(기존 H 보정값 기준 시각과 동일)
+            #   + 그 전까지 트랙에 채택된 데이터를 D 회귀 버퍼에 바로 넣는다.
+            if (track_on and _track.active
+                    and initial_stable_freq == 0
+                    and filling_elapsed >= INIT_REF_TIME):
+                l_ref = _track.predict(INIT_REF_TIME)
+                if l_ref > 0:
+                    initial_stable_freq = float(SOUND_SPEED / (4.0 * l_ref))
+                    initial_stable_time = float(INIT_REF_TIME)
+                    n_fill = 0
+                    for t_h, f_h in _track.hist:
+                        if t_h >= WATER_SETTLE_SEC and f_h > 0:
+                            reg_time_buffer.append(float(t_h))
+                            reg_inv_freq_buffer.append(1.0 / float(f_h))
+                            n_fill += 1
+                    if len(reg_time_buffer) > REG_MIN_POINTS:
+                        _reg_event.set()
+                    print(f'\n[★ 초기주파수 확정(트랙)] {initial_stable_freq:.0f}Hz @t={INIT_REF_TIME:.2f}s'
+                          f' | 트랙 데이터 {n_fill}점을 D 회귀에 추가 | 현재 t={filling_elapsed:.1f}s')
 
         # ── [v5.30-PKFLOOR] spike 시 max_freq_seen 갱신 차단 ─────────
         with lock:
