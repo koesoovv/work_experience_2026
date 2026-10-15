@@ -1,11 +1,21 @@
-# smart_water_core.py  ── v5.33-vol-round-label
+# smart_water_core.py  ── v5.34-flow-noise-fix
+#
+# [v5.34-FLOW-NOISE] 급수 중에만 나는 정상 톤(펌프/밸브/배관 소음) 고착 수정
+#   장비 실행(250mL 비커): raw가 6~18s 내내 ≈500Hz에 고착 → D/H 미확정 → 자동 정지 안 됨.
+#   원인 ① v5.33에서 SPLASH 구간 노이즈 학습을 제거해 급수 중 소음이 노이즈 목록에서 빠짐
+#        ② 피크 후보 기준(prominence)을 '전체 최대 피크(=소음)' 대비로 잡아, 더 약한 실제 공명이
+#           후보에서 탈락하고, 후보가 전부 노이즈면 노이즈를 그대로 채택(FFT)
+#   변경 ① SPLASH 구간(물 나오는 처음 SPLASH_GUARD_TIME초) 100~700Hz 피크 중
+#           같은 bin(±1)에 SPLASH_PERSIST_RATIO 이상 머문 '주파수 고정 소음'만 노이즈로 등록
+#           (컵 공명은 물이 차며 계속 올라가므로 한 bin에 오래 머물지 않음)
+#        ② LPC/FFT 피크 기준을 '노이즈 대역 제외 최대값' 대비로 계산, 노이즈 대역 피크는 후보에서 제외,
+#           남는 후보가 없으면 노이즈를 고르지 않음
 #
 # [v5.33-NOISE-PERSIST] 노이즈 프로파일은 '지속적으로 나타나는 피크'만 등록
 #   기존: 배경소음 3초 동안 모든 청크의 피크(20Hz 간격)를 등록 → 백색잡음만으로도
 #   300~1500Hz가 ±25Hz 제외 범위로 100% 덮여 LPC 후보가 전부 제거됨(시뮬레이션 확인).
 #   변경: 보정 청크의 NOISE_PERSIST_RATIO 이상에서 반복된 피크만 등록.
-#   SPLASH 구간(물 나오는 중) 피크 학습은 컵 자체 공명(키 큰 컵 500~700Hz)을
-#   노이즈로 등록할 수 있어 제거. SPLASH 구간은 검출 보류(가드)만 유지.
+#   (SPLASH 구간 학습 제거는 v5.34에서 '주파수 고정 소음만 등록' 방식으로 복구)
 #
 # [v5.33-CTRL-MED] 제어(수위 계산) 주파수를 최근 CTRL_MEDIAN_SEC초 raw 중앙값으로 변경
 #   실험 500회(유효 494) 중 브릿지 미사용 295회 분석, '정지 순간 코어 추정 수위 - 실측':
@@ -179,6 +189,12 @@ NOISE_FLOOR_PCTILE = 70
 # ── [v5.33-NOISE-PERSIST] 지속 노이즈 판정 ────────────────────────────
 NOISE_PERSIST_RATIO = 0.8   # 보정 청크 중 이 비율 이상 같은 bin(±1)에서 반복된 피크만 노이즈로 등록
                             # 백색잡음 피크의 bin 점유율은 약 2/3×통과율(<0.5) → 0.8이면 우연 통과 확률 극히 낮음
+NOISE_EXCLUDE_HZ    = 25.0  # 노이즈 주파수 ±이 범위의 피크는 공명 후보에서 제외(v5.32와 동일 폭)
+
+# ── [v5.34-FLOW-NOISE] 급수 중 소음 학습 ─────────────────────────────
+SPLASH_NOISE_MAX_HZ  = 700.0   # SPLASH 구간 소음 학습 대역 상한(v5.32와 동일: 100~700Hz)
+SPLASH_PERSIST_RATIO = 0.5     # SPLASH 청크 중 이 비율 이상 같은 bin(±1)에 머문 피크만 등록
+                               # 넓은 컵(D10cm)도 6초 동안 공명이 ≈60Hz(5~6 bin) 이동 → bin 점유율 <0.4
 
 # ── [v5.29-ASYM-EMA] f_for_stop 비대칭 EMA ──────────────────────────
 FSCORE_ALPHA_UP   = 0.80   # 상승 반영 속도 (새 값 80% 즉시 반영)
@@ -303,6 +319,9 @@ noise_floor_level       = 0.0
 _noise_peak_counts      = {}         # [v5.33-NOISE-PERSIST] FFT bin → 보정 구간 피크 등장 횟수
 _noise_calib_chunks     = 0          # [v5.33-NOISE-PERSIST] 보정 구간 청크 수
 _noise_profile_ready    = False      # [v5.33-NOISE-PERSIST] 지속 피크 목록 확정 여부
+_splash_peak_counts     = {}         # [v5.34-FLOW-NOISE] FFT bin → SPLASH 구간 피크 등장 횟수
+_splash_chunks          = 0          # [v5.34-FLOW-NOISE] SPLASH 구간 청크 수
+_splash_profile_ready   = False      # [v5.34-FLOW-NOISE] 급수 중 소음 등록 완료 여부
 request_finish          = False
 last_stable_f           = 0.0
 last_detected_f         = 0.0
@@ -570,15 +589,15 @@ def _flow_volume_to_fill_pct(q_ml_s: float, dt_s: float, diameter_cm: float, ini
     return (added_ml / (total_air_volume_ml + 1e-12)) * 100.0
 
 
-def _persistent_noise_peaks(peak_counts: dict, n_chunks: int) -> list:
+def _persistent_noise_peaks(peak_counts: dict, n_chunks: int, ratio: float = NOISE_PERSIST_RATIO) -> list:
     """
-    [v5.33-NOISE-PERSIST] 보정 구간에서 NOISE_PERSIST_RATIO 이상 반복된 피크 주파수만 반환.
-    정상 톤(팬·전원 험)은 같은 bin(±1)에 반복해서 나타나고, 백색잡음 피크는 매 청크 위치가 바뀐다.
+    [v5.33-NOISE-PERSIST] 청크의 ratio 이상에서 같은 bin(±1)에 반복된 피크 주파수만 반환.
+    정상 톤(팬·전원 험·펌프)은 같은 bin에 반복해서 나타나고, 백색잡음 피크와 컵 공명은 위치가 바뀐다.
     """
     if n_chunks <= 0 or not peak_counts:
         return []
     bin_hz = SAMPLE_RATE / CHUNK_SIZE                              # FFT bin 간격(≈10.8Hz)
-    need   = NOISE_PERSIST_RATIO * n_chunks
+    need   = ratio * n_chunks
     result = []
     for b, cnt in peak_counts.items():
         near = cnt + max(peak_counts.get(b - 1, 0), peak_counts.get(b + 1, 0))   # 톤이 두 bin 사이에서 흔들리는 것 허용
@@ -586,6 +605,15 @@ def _persistent_noise_peaks(peak_counts: dict, n_chunks: int) -> list:
         if near >= need and is_local_max:
             result.append(float(b * bin_hz))
     return sorted(result)
+
+
+def _near_noise(freqs) -> np.ndarray:
+    """[v5.34-FLOW-NOISE] 각 주파수가 노이즈 목록 ±NOISE_EXCLUDE_HZ 안에 있으면 True."""
+    freqs = np.asarray(freqs, dtype=float)
+    nf = np.asarray(list(noise_profile), dtype=float)
+    if nf.size == 0 or freqs.size == 0:
+        return np.zeros(freqs.shape, dtype=bool)
+    return np.min(np.abs(freqs[:, None] - nf[None, :]), axis=1) < NOISE_EXCLUDE_HZ
 
 
 def loess_smooth(x, y, frac=LOESS_FRAC, degree=LOESS_DEGREE):
@@ -664,16 +692,15 @@ def lpc_main_frequency(chunk, last_freq, f_min, f_max):
         if not np.any(mask):
             continue
         vf, vm   = freqs[mask], mag[mask]
-        prom     = vm.max() * LPC_PEAK_PROM
-        peaks, _ = signal.find_peaks(vm, prominence=prom, distance=4)
-        if len(peaks) == 0:
-            peaks = np.array([np.argmax(vm)])
-        pf, pm = vf[peaks], vm[peaks]
-        clean  = [i for i, f in enumerate(pf)
-                  if not any(abs(f - nf) < 25.0 for nf in noise_profile)]
-        if not clean:
+        near     = _near_noise(vf)                                   # [v5.34] 노이즈 대역 bin
+        if np.all(near):
             continue
-        pf, pm = pf[clean], pm[clean]
+        prom     = vm[~near].max() * LPC_PEAK_PROM                   # [v5.34] 기준 = 노이즈 제외 최대값
+        peaks, _ = signal.find_peaks(vm, prominence=prom, distance=4)
+        peaks    = peaks[~near[peaks]]                               # [v5.34] 노이즈 대역 피크 제외
+        if len(peaks) == 0:
+            peaks = np.array([np.argmax(np.where(near, -np.inf, vm))])
+        pf, pm = vf[peaks], vm[peaks]
         pm_n   = pm / (pm.max() + 1e-12)
         if last_freq > 0:
             score = pm_n - (1.0 / LPC_CONTINUITY_W) * np.abs(pf - last_freq)
@@ -693,15 +720,14 @@ def fft_backup_frequency(chunk, last_freq, f_min, f_max):
     if not np.any(mask):
         return 0.0
     vf, vm   = freqs[mask], fft_val[mask]
-    peaks, _ = signal.find_peaks(vm, prominence=vm.max() * 0.15, distance=10)
+    near     = _near_noise(vf)                                       # [v5.34] 노이즈 대역 bin
+    if np.all(near):
+        return 0.0
+    peaks, _ = signal.find_peaks(vm, prominence=vm[~near].max() * 0.15, distance=10)
+    peaks    = peaks[~near[peaks]]                                   # [v5.34] 노이즈 피크를 고르지 않음
     if len(peaks) == 0:
-        return float(vf[np.argmax(vm)])
+        return float(vf[np.argmax(np.where(near, -np.inf, vm))])
     pf, pm = vf[peaks], vm[peaks]
-    clean  = [i for i, f in enumerate(pf)
-              if not any(abs(f - nf) < 25.0 for nf in noise_profile)]
-    if not clean:
-        clean = list(range(len(pf)))
-    pf, pm = pf[clean], pm[clean]
     pm_n   = pm / (pm.max() + 1e-12)
     if last_freq > 0:
         score = pm_n - (1.0 / 800.0) * np.abs(pf - last_freq)
@@ -994,6 +1020,7 @@ def start_filling_local() -> None:
     global request_finish, last_stable_f, last_current_air, last_fill_pct
     global dynamic_min_limit, noise_profile, noise_floor_level
     global _noise_peak_counts, _noise_calib_chunks, _noise_profile_ready
+    global _splash_peak_counts, _splash_chunks, _splash_profile_ready
     global max_freq_seen, tracking_mode, tracking_mode_hits
     global theory_slope, theory_intercept, theory_locked
     global _prev_buf_median, _freeze_count
@@ -1067,6 +1094,9 @@ def start_filling_local() -> None:
         _noise_peak_counts      = {}
         _noise_calib_chunks     = 0
         _noise_profile_ready    = False
+        _splash_peak_counts     = {}
+        _splash_chunks          = 0
+        _splash_profile_ready   = False
         noise_floor_level       = 0.0
         dynamic_Q               = FLOW_RATE
         max_freq_seen           = 0.0
@@ -1119,6 +1149,7 @@ def audio_callback(indata, frames, time_info, status):
     global initial_stable_freq, initial_stable_time
     global last_print_time, dynamic_min_limit, noise_profile, noise_floor_level
     global _noise_calib_chunks, _noise_profile_ready
+    global _splash_chunks, _splash_profile_ready
     global last_ctrl_f, last_fill_volume_ml
     global max_freq_seen, tracking_mode, tracking_mode_hits
     global _prev_buf_median, _freeze_count
@@ -1176,11 +1207,33 @@ def audio_callback(indata, frames, time_info, status):
 
         filling_elapsed = elapsed - NOISE_CALIBRATION_TIME
 
-        # ── 2단계: SPLASH 가드 (물 떨어지는 초기 충격음 구간은 검출 보류) ──
-        #   [v5.33-NOISE-PERSIST] 이 구간의 피크 학습은 제거: 컵 자체 공명(키 큰 컵 500~700Hz)을
-        #   노이즈로 등록해 이후 해당 대역의 공명을 놓치게 만들 수 있다.
+        # ── 2단계: SPLASH 구간 — 검출 보류 + 급수 중 소음 학습 [v5.34-FLOW-NOISE] ──
+        #   피크를 바로 등록하지 않고 bin별 등장 횟수만 센다(주파수 고정 소음만 남기기 위함).
         if filling_elapsed < SPLASH_GUARD_TIME:
+            windowed = chunk * np.hamming(len(chunk))
+            fft_val  = np.abs(np.fft.rfft(windowed))
+            freqs    = np.fft.rfftfreq(len(chunk), d=1.0 / SAMPLE_RATE)
+            mask     = (freqs >= 100) & (freqs < SPLASH_NOISE_MAX_HZ)
+            if np.any(mask):
+                idx      = np.flatnonzero(mask)
+                vm       = fft_val[mask]
+                peaks, _ = signal.find_peaks(vm, prominence=vm.max() * 0.3)
+                with lock:
+                    _splash_chunks += 1
+                    for p in peaks:
+                        b = int(idx[p])
+                        _splash_peak_counts[b] = _splash_peak_counts.get(b, 0) + 1
             return
+
+        # [v5.34-FLOW-NOISE] SPLASH 종료 후 첫 청크에서 급수 중 고정 소음을 노이즈 목록에 추가
+        if not _splash_profile_ready:
+            flow_noise = _persistent_noise_peaks(_splash_peak_counts, _splash_chunks, SPLASH_PERSIST_RATIO)
+            with lock:
+                added = [f for f in flow_noise if not any(abs(f - nf) < 20 for nf in noise_profile)]
+                noise_profile = sorted(list(noise_profile) + added)
+                _splash_profile_ready = True
+            print(f'\n[급수 중 소음] 고정 피크 {len(added)}개 추가 {[round(f) for f in added]}'
+                  f' (SPLASH {_splash_chunks}청크) → 노이즈 목록 {[round(f) for f in noise_profile]}')
 
         with lock:
             _last   = float(last_tracked_freq)
