@@ -1,4 +1,14 @@
-# smart_water_core.py  ── v5.34-flow-noise-fix
+# smart_water_core.py  ── v5.35-half-lock-escape
+#
+# [v5.35-HALF-LOCK] 추적 주파수가 실제 공명의 절반에 고착되는 문제 해제
+#   증상: raw가 실제 공명의 1/2에 머물며 천천히만 오름 → 초기 주파수도 절반으로 확정 → H 과대(16cm)
+#         → 수위 과소 추정(실제 90%인데 71%) → 늦은 정지/넘침. v5.32 실패 6회 중 mug_cup 2회도 같은 패턴
+#         (raw ≈ 575Hz, 정상 시행 1128Hz의 절반).
+#   원인: _harmonic_correct가 '추적값의 1.8~2.2배' 검출을 2배음으로 보고 반으로 나눔 → 추적값이 한 번
+#         절반으로 잘못 잡히면 진짜 공명을 계속 절반으로 깎아 고착이 유지됨.
+#   변경: 한쪽이 막힌 관(컵)은 홀수 배음(f, 3f, 5f)만 생기므로 '2배' 성분은 물리적으로 지속될 수 없다.
+#         보정 전 검출값이 최근 HALF_LOCK_WINDOW_SEC 동안 HALF_LOCK_RATIO 이상 추적값의 1.8~2.2배이면
+#         추적값을 그 값으로 재설정하고, 잘못된 초기 주파수로 만든 D/H 모델을 초기화해 다시 추정한다.
 #
 # [v5.34-FLOW-NOISE] 급수 중에만 나는 정상 톤(펌프/밸브/배관 소음) 고착 수정
 #   장비 실행(250mL 비커): raw가 6~18s 내내 ≈500Hz에 고착 → D/H 미확정 → 자동 정지 안 됨.
@@ -119,6 +129,12 @@ CTRL_HIT_DELAY_ADV_PCT  = 2.0    # 히트 5회(≈0.37s) 동안 오르는 수위
 ESTIMATION_ROUNDS       = 3      # 총 추정 횟수(1라운드 = 기존 최초 잠금)
 ROUND_INTERVAL_SEC      = 2.5    # 라운드 간 최소 간격(s)
 ROUND_MAX_H_CHANGE_CM   = 2.0    # 라운드 갱신 시 허용 H 변화량(cm). 초과하면 이상치로 보고 유지
+
+# ── [v5.35-HALF-LOCK] 절반 주파수 고착 해제 ──────────────────────────
+HALF_LOCK_WINDOW_SEC    = 1.0    # 판정 창(s)
+HALF_LOCK_MIN_CHUNKS    = 6      # 판정에 필요한 최소 청크 수(≈0.56s)
+HALF_LOCK_RATIO         = 0.6    # 창 안에서 '추적값의 1.8~2.2배' 검출 비율이 이 이상이면 고착으로 판단
+HALF_LOCK_MAX_RESETS    = 2      # 급수 1회당 최대 재설정 횟수(진동 방지)
 
 # ── [v5.33-VALVE-LABEL] 자동 라벨 ─────────────────────────────────────
 VALVE_DEAD_TIME_SEC     = 0.0    # 밸브 열림→출수 지연(s). 미측정이라 0, 실측 후 입력
@@ -333,6 +349,9 @@ cup_volume_ml           = 0.0        # [v5.33-VOLUME] 추정 컵 용적 π(D/2)�
 last_fill_volume_ml     = 0.0        # [v5.33-VOLUME] 추정 채운 물 부피
 valve_open_time         = 0.0        # [v5.33-VALVE-LABEL] 밸브 열린 시각(time.time)
 valve_close_time        = 0.0        # [v5.33-VALVE-LABEL] 밸브 닫힌 시각(time.time)
+half_lock_buffer        = deque()    # [v5.35-HALF-LOCK] (t, 2배 여부, 보정 전 주파수)
+half_lock_resets        = 0          # [v5.35-HALF-LOCK] 이번 급수의 재설정 횟수
+_model_gen              = 0          # [v5.35-HALF-LOCK] 모델 초기화 세대(회귀 스레드의 늦은 결과 폐기용)
 est_round               = 0          # [v5.33-ROUNDS] 완료된 D/H 추정 라운드 수
 round_d_cm              = []         # [v5.33-ROUNDS] 라운드별 D
 round_h_cm              = []         # [v5.33-ROUNDS] 라운드별 H
@@ -754,14 +773,15 @@ def _harmonic_correct(f: float, ref: float) -> float:
 
 
 def get_frequency(chunk, last_freq, f_min, f_max):
+    """반환: (배음 보정 후 주파수, 보정 전 주파수). [v5.35] 보정 전 값은 절반 고착 판정용."""
     filtered = signal.sosfilt(HP_SOS, chunk.astype(float))
-    lpc_f = lpc_main_frequency(filtered, last_freq, f_min, f_max)
-    lpc_f = _harmonic_correct(lpc_f, last_freq)
+    lpc_pre = lpc_main_frequency(filtered, last_freq, f_min, f_max)
+    lpc_f   = _harmonic_correct(lpc_pre, last_freq)
     if lpc_f > 0:
-        return float(lpc_f)
-    fft_f = fft_backup_frequency(filtered, last_freq, f_min, f_max)
-    fft_f = _harmonic_correct(fft_f, last_freq)
-    return float(fft_f)
+        return float(lpc_f), float(lpc_pre)
+    fft_pre = fft_backup_frequency(filtered, last_freq, f_min, f_max)
+    fft_f   = _harmonic_correct(fft_pre, last_freq)
+    return float(fft_f), float(fft_pre)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -803,6 +823,72 @@ def theory_freq(t: float) -> float:
 # ════════════════════════════════════════════════════════════════════
 #  회귀 워커 스레드
 # ════════════════════════════════════════════════════════════════════
+def _reset_after_half_lock(new_ref: float, elapsed: float, old_ref: float) -> None:
+    """
+    [v5.35-HALF-LOCK] 추적값을 new_ref로 재설정하고, 절반 주파수로 만든 초기 주파수·D/H 모델을 초기화한다.
+    초기 주파수는 다음 10개 안정 샘플로 다시 확정되고, D/H는 새 회귀 데이터로 다시 추정된다.
+    """
+    global last_tracked_freq, last_stable_f, freq_buffer, _prev_buf_median, _freeze_count
+    global dynamic_min_limit, peak_lock_floor, max_freq_seen, _f_stop_ema
+    global tracking_mode, tracking_mode_hits, half_lock_resets, _model_gen
+    global initial_stable_freq, initial_stable_time, current_diameter, init_air_len_cm, _eff_target_air_cm
+    global calibration_done, target_freq, theory_slope, theory_intercept, theory_locked, dynamic_Q
+    global est_round, round_d_cm, round_h_cm, round_t_sec, cup_volume_ml
+    global last_fill_pct, last_fill_volume_ml, last_decision_fill_pct, consecutive_stop_hits
+    global last_model_valid, last_reject_reason, last_d_locked_cm, last_init_air_locked_cm
+
+    with lock:
+        had_model = init_air_len_cm > 0 or initial_stable_freq > 0
+        last_tracked_freq  = new_ref
+        last_stable_f      = new_ref
+        freq_buffer        = deque([new_ref])
+        _prev_buf_median   = 0.0
+        _freeze_count      = 0
+        dynamic_min_limit  = max(FREQ_MIN_LIMIT, new_ref * 0.75)
+        peak_lock_floor    = new_ref
+        max_freq_seen      = new_ref
+        _f_stop_ema        = new_ref
+        tracking_mode      = False
+        tracking_mode_hits = 0
+        ctrl_raw_buffer.clear()
+        half_lock_buffer.clear()
+        half_lock_resets  += 1
+        _model_gen        += 1                                   # 회귀 스레드가 계산 중이던 이전 결과는 버림
+
+        # 절반 주파수 기반 모델 초기화
+        initial_stable_freq = 0.0
+        initial_stable_time = 0.0
+        init_stable_buffer.clear()
+        reg_time_buffer.clear()
+        reg_inv_freq_buffer.clear()
+        diameter_candidates.clear()
+        current_diameter    = 0.0
+        init_air_len_cm     = 0.0
+        _eff_target_air_cm  = 3.0
+        calibration_done    = False
+        target_freq         = 0.0
+        theory_slope        = 0.0
+        theory_intercept    = 0.0
+        theory_locked       = False
+        dynamic_Q           = FLOW_RATE
+        est_round           = 0
+        round_d_cm          = []
+        round_h_cm          = []
+        round_t_sec         = []
+        cup_volume_ml       = 0.0
+        last_fill_pct       = 0.0
+        last_fill_volume_ml = 0.0
+        last_decision_fill_pct = 0.0
+        consecutive_stop_hits  = 0
+        last_d_locked_cm       = 0.0
+        last_init_air_locked_cm = 0.0
+        last_model_valid    = False
+        last_reject_reason  = 'half_lock_reset'
+    print(f'\n[★ 절반 주파수 고착 해제] t={elapsed:.1f}s | 추적 {old_ref:.0f}Hz → {new_ref:.0f}Hz'
+          f' | {"D/H 모델 초기화 후 재추정" if had_model else "초기 주파수 재확정"}'
+          f' ({half_lock_resets}/{HALF_LOCK_MAX_RESETS})')
+
+
 def _regression_step():
     """회귀 워커 1회 처리. [v5.33-ROUNDS] D/H를 ESTIMATION_ROUNDS회 추정한다."""
     global current_diameter, target_freq, calibration_done
@@ -824,6 +910,7 @@ def _regression_step():
         _cand_cnt = len(diameter_candidates)
         _dyn_q    = float(dynamic_Q)
         _est_done = est_round >= ESTIMATION_ROUNDS
+        _gen      = _model_gen                                    # [v5.35] 계산 시작 시점의 모델 세대
 
     if _est_done:
         return
@@ -841,6 +928,8 @@ def _regression_step():
             print(f'\n[회귀] slope={s_a:.6f} | r²={r_sq:.4f}')
 
     with lock:
+        if _model_gen != _gen:                                    # [v5.35] 계산 중 모델이 초기화됨 → 폐기
+            return
         if s_a is not None and r_sq > THEORY_LOCK_R2 and not theory_locked:
             theory_slope     = s_a
             theory_intercept = s_b
@@ -904,6 +993,8 @@ def _regression_step():
         return
 
     with lock:
+        if _model_gen != _gen:                                    # [v5.35] 계산 중 모델이 초기화됨 → 폐기
+            return
         last_r2 = r_sq
         diameter_candidates.append(temp_D)
 
@@ -1021,6 +1112,7 @@ def start_filling_local() -> None:
     global dynamic_min_limit, noise_profile, noise_floor_level
     global _noise_peak_counts, _noise_calib_chunks, _noise_profile_ready
     global _splash_peak_counts, _splash_chunks, _splash_profile_ready
+    global half_lock_buffer, half_lock_resets, _model_gen
     global max_freq_seen, tracking_mode, tracking_mode_hits
     global theory_slope, theory_intercept, theory_locked
     global _prev_buf_median, _freeze_count
@@ -1097,6 +1189,9 @@ def start_filling_local() -> None:
         _splash_peak_counts     = {}
         _splash_chunks          = 0
         _splash_profile_ready   = False
+        half_lock_buffer        = deque()
+        half_lock_resets        = 0
+        _model_gen             += 1
         noise_floor_level       = 0.0
         dynamic_Q               = FLOW_RATE
         max_freq_seen           = 0.0
@@ -1285,10 +1380,25 @@ def audio_callback(indata, frames, time_info, status):
 
         if not _init_confirmed:
             filtered   = signal.sosfilt(HP_SOS, chunk.astype(float))
-            detected_f = fft_backup_frequency(filtered, _last, current_floor, current_ceil)
-            detected_f = _harmonic_correct(detected_f, _last)
+            f_pre      = fft_backup_frequency(filtered, _last, current_floor, current_ceil)
+            detected_f = _harmonic_correct(f_pre, _last)
         else:
-            detected_f = get_frequency(chunk, _last, current_floor, current_ceil)
+            detected_f, f_pre = get_frequency(chunk, _last, current_floor, current_ceil)
+
+        # [v5.35-HALF-LOCK] 보정 전 검출이 추적값의 약 2배로 지속되면 추적값이 절반에 고착된 것
+        if _last > 0 and f_pre > 0 and not bridge_active and half_lock_resets < HALF_LOCK_MAX_RESETS:
+            ratio_pre = f_pre / _last
+            half_lock_buffer.append((filling_elapsed, 1.8 <= ratio_pre <= 2.2, f_pre))
+            while half_lock_buffer and half_lock_buffer[0][0] < filling_elapsed - HALF_LOCK_WINDOW_SEC:
+                half_lock_buffer.popleft()
+            n_win  = len(half_lock_buffer)
+            doubles = [f for _, is_double, f in half_lock_buffer if is_double]
+            if n_win >= HALF_LOCK_MIN_CHUNKS and len(doubles) / n_win >= HALF_LOCK_RATIO:
+                new_ref = float(np.median(doubles))
+                _reset_after_half_lock(new_ref, filling_elapsed, _last)
+                detected_f = new_ref
+                _last = _last_s = new_ref
+                _init = 0.0
 
         if detected_f < current_floor or detected_f == 0:
             detected_f = 0.0
