@@ -1,4 +1,14 @@
-# smart_water_core.py  ── v5.41-track-coast
+# smart_water_core.py  ── v5.42-track-stall
+#
+# [v5.42-TRACK-STALL] 장비 실행(250mL 비커): 수위 ~50~60%부터 실제 공명이 안 보이고, 트랙이 제자리에서 흔들리는
+#   피크(≈1230Hz, ±40Hz)를 계속 '채택'해 6초 넘게 평탄 → 트랙을 잃은 것으로 판단하지 않아 예측(v5.41 ⑤)이
+#   시작되지 않음 + 평탄한 데이터로 D 회귀 r²가 안 나와 D/H 미확정 → 정지 불가 → 넘침.
+#   (흔들림 폭이 커서 v5.41 ③ 고정 톤(±3Hz) 제거에도 안 걸림.) 수정:
+#   ① 정체 감지: 최근 TRACK_STALL_WINDOW_SEC 동안 채택값의 기울기가 기준 기울기의
+#      TRACK_STALL_RATIO 보다 평평하면(급수 중 공명은 멈출 수 없음) 트랙을 놓고, 정체 시작 전 데이터로 기준점을 잡아 예측
+#      판정은 신뢰 기준(D/H 모델 또는 고정된 v_ref)이 생긴 뒤에만, 기준은 모델·v_ref와 직전 구간 중 평평한 쪽(오판 방지)
+#   ② 정체 감지 후 재확정은 정체 주파수 × TRACK_STALL_REACQ_RATIO 이상, 예측 중 재확정은 예측 × TRACK_COAST_REACQ_RATIO
+#      이상인 직선만(정체 피크에 다시 붙지 않음)
 #
 # [v5.41-TRACK-COAST] 장비 실행(250mL 비커): 수위 ~50%(약 1200Hz)부터 실제 공명이 잡히지 않아 트랙이
 #   정체 피크(≈1190Hz)를 따라가다 끊기고, 이어 나타난 저주파 소음(520~600Hz)으로 재확정 → 그 값으로
@@ -274,6 +284,15 @@ TRACK_TONE_SUPPORT      = 0.8    # 창 안 청크의 이 비율 이상에서 같
 TRACK_TONE_MIN_CHUNKS   = 8      # 고정 톤 판정에 필요한 창 안 청크 수
 TRACK_VREF_LEARN_SEC    = 4.0    # 트랙 확인 후 이 시간이 지나면 기준 기울기(v_ref)를 한 번 계산해 고정(s)
 TRACK_VREF_MIN_SPAN_SEC = 4.0    # v_ref 계산에 필요한 실제 채택 데이터 시간 폭(s). 짧으면 기울기 오차가 큼
+TRACK_STALL_WINDOW_SEC  = 3.0    # [v5.42] 정체 판정 창(s). 짧으면 측정 흔들림만으로 오판(1.5s에서 오판 확인)
+TRACK_STALL_REF_SEC     = 5.0    # [v5.42] 정체 판정 기준 기울기 구간(정체 창 바로 앞, s). 위가 넓은 컵의 완만한 기울기 변화를 따라감
+TRACK_STALL_MIN_POINTS  = 15     # [v5.42] 정체 판정 창·기준 구간에 필요한 실제 채택 수
+TRACK_STALL_RATIO       = 0.5    # [v5.42] 최근 기울기가 기준 기울기의 이 비율보다 평평하면 정체
+TRACK_STALL_REF_MIN     = 0.6    # [v5.42] 직전 구간 기준은 신뢰 기준(모델·v_ref)의 이 비율보다 평평하게 잡지 않음
+                                 # (직전 구간 자체가 정체 피크일 때 정체를 못 잡는 문제 방지, 위가 넓은 컵의 감소 폭은 허용)
+TRACK_COAST_REACQ_RATIO = 0.90   # [v5.42] 예측 중 재확정 직선의 현재 주파수 ≥ 예측 × 이 값(예측 기울기는 모델·v_ref만 사용)
+TRACK_STALL_REACQ_RATIO = 1.08   # [v5.42] 정체 감지 후 재확정 직선의 현재 주파수는 정체 주파수 × 이 값 이상
+                                 # (정체 피크 흔들림 ±3~4%보다 크게 — 다시 정체 피크에 붙지 않게. 실제 공명은 계속 올라가 곧 넘음)
 TRACK_COAST_FIT_SEC     = 3.0    # 예측 시작점 계산에 쓰는 최근 실제 채택 구간(s)
 TRACK_COAST_MAX_SEC     = 15.0   # 트랙을 잃은 뒤 예측으로 이어가는 최대 시간(s). 90% 목표도 덮도록 김
 INIT_REF_TIME           = 6.85   # 초기 주파수 기준 시각(s): 실험 494회 모두 6.85±0.01s에 확정 → H 보정값 기준
@@ -710,6 +729,7 @@ class _FreqTrack:
         self.coast_t0      = 0.0                # 예측 기준점(마지막 실제 채택 시각)
         self.coast_l0      = 0.0                # 예측 기준점의 ℓ(cm)
         self.coast_v       = 0.0                # 예측 기울기(cm/s, 음수)
+        self.stall_f       = 0.0                # [v5.42] 마지막 정체 구간 주파수(중앙값), 재확정 하한에 사용
         self.coasting      = False              # 이번 청크 출력이 예측값(측정 아님)
         self.reanchor_reason = 'initial'        # initial / harmonic / reacquire
         self.confirmed     = False              # 하류로 출력 중
@@ -784,6 +804,22 @@ def _theil_sen(T, L):
     return a, b
 
 
+def _track_reacq_min_f(tr: _FreqTrack, t: float) -> float:
+    """
+    재확정 직선의 현재 주파수 하한(Hz), 없으면 0.
+    [v5.41] 출력했던 트랙 이후: 하한(최근 채택 중앙값의 최대) × TRACK_REACQ_MIN_RATIO
+    [v5.42] 정체 감지 후: 정체 주파수 × TRACK_STALL_REACQ_RATIO (정체 피크로 다시 붙지 않게)
+            예측 중: 예측 주파수 × TRACK_COAST_REACQ_RATIO (예측보다 크게 뒤처진 피크로 다시 붙지 않게)
+    """
+    f_min = TRACK_REACQ_MIN_RATIO * tr.f_floor if tr.f_floor > 0 else 0.0
+    if tr.stall_f > 0:
+        f_min = max(f_min, TRACK_STALL_REACQ_RATIO * tr.stall_f)
+    if tr.coast_on:
+        l_c   = max(0.5, tr.coast_l0 + tr.coast_v * (t - tr.coast_t0))
+        f_min = max(f_min, TRACK_COAST_REACQ_RATIO * SOUND_SPEED / (4.0 * l_c))
+    return f_min
+
+
 def _track_bootstrap(tr: _FreqTrack, t_now: float) -> bool:
     """최근 후보에서 물리 기울기 범위 안의 직선을 RANSAC(쌍 → 직선 → 지지 청크 수)으로 찾는다."""
     window = [(t, fs) for (t, fs) in tr.cand if t >= t_now - TRACK_BOOT_WINDOW_SEC]
@@ -811,8 +847,9 @@ def _track_bootstrap(tr: _FreqTrack, t_now: float) -> bool:
         sel = np.random.default_rng(len(slope)).choice(len(slope), TRACK_MAX_PAIRS, replace=False)
         ii, slope = ii[sel], slope[sel]
     inter = L[ii] - slope * T[ii]
-    if tr.f_floor > 0:                                            # [v5.41] 확인된 트랙 이후: 주파수는 내려갈 수 없음
-        l_max = SOUND_SPEED / (4.0 * TRACK_REACQ_MIN_RATIO * tr.f_floor)   # 현재 시각 직선값이 하한 아래면 제외
+    f_min_line = _track_reacq_min_f(tr, t_now)
+    if f_min_line > 0:                                            # [v5.41] 확인된 트랙 이후: 주파수는 내려갈 수 없음
+        l_max = SOUND_SPEED / (4.0 * f_min_line)                  # 현재 시각 직선값이 하한 아래면 제외
         keep  = inter + slope * t_now <= l_max
         inter, slope = inter[keep], slope[keep]
         if len(slope) == 0:
@@ -848,7 +885,7 @@ def _track_bootstrap(tr: _FreqTrack, t_now: float) -> bool:
                 a2, b2 = _theil_sen(T[hp], L[hp])
                 if not (TRACK_SLOPE_MIN_CM_S <= -b2 <= TRACK_SLOPE_MAX_CM_S):
                     continue
-                if tr.f_floor > 0 and SOUND_SPEED / (4.0 * (a2 + b2 * t_now)) < TRACK_REACQ_MIN_RATIO * tr.f_floor:
+                if f_min_line > 0 and SOUND_SPEED / (4.0 * (a2 + b2 * t_now)) < f_min_line:
                     continue                                      # [v5.41] 하한 아래로 내려가는 교체 금지
                 n2, idx2 = _track_line_support(T, L, C, a2, b2)
                 if n2 < TRACK_MIN_INLIER_CHUNKS:
@@ -866,7 +903,7 @@ def _track_bootstrap(tr: _FreqTrack, t_now: float) -> bool:
     a, b = _theil_sen(T[idx], L[idx])
     if not (TRACK_SLOPE_MIN_CM_S <= -b <= TRACK_SLOPE_MAX_CM_S):
         return False
-    if tr.f_floor > 0 and SOUND_SPEED / (4.0 * (a + b * t_now)) < TRACK_REACQ_MIN_RATIO * tr.f_floor:
+    if f_min_line > 0 and SOUND_SPEED / (4.0 * (a + b * t_now)) < f_min_line:
         return False                                              # [v5.41] 재적합 후에도 하한 아래면 제외
 
     resid  = L[idx] - (a + b * T[idx])
@@ -984,6 +1021,7 @@ def _track_harmonic_watch(tr: _FreqTrack, cands: np.ndarray, f: float, t: float)
         tr.confirmed, tr.n_since, tr.reanchor_pending = False, 0, True
         tr.reanchor_reason = 'harmonic'
         tr.f_floor = tr.f_floor / scale                          # 이전 출력은 배음 기준이었으므로 하한도 환산
+        tr.stall_f = tr.stall_f / scale
         tr.v_ref   = 0.0                                         # 기준 기울기 다시 학습
         tr.coast_on = False
         print(f'\n[트랙] 추적 중 {name}를 따라가고 있음 → 기본 공명으로 이동 (t={t:.1f}s,'
@@ -1048,19 +1086,20 @@ def _track_coast_slope(tr: _FreqTrack):
     return 0.0, ''
 
 
-def _track_lose(tr: _FreqTrack, t: float, why: str) -> None:
+def _track_lose(tr: _FreqTrack, t: float, why: str, t_anchor: float = None) -> None:
     """
     트랙을 잃음 → 재탐색. [v5.41] 하류로 출력 중이던 트랙이면 마지막 실제 채택 상태에서 예측을 시작한다
     (물은 계속 같은 유량으로 차므로 ℓ도 같은 속도로 줄어듦). 기울기는 _track_coast_slope().
+    [v5.42] t_anchor: 예측 기준 시각(정체 감지 시 정체 시작 시각 — 정체 구간 값으로 기준점을 잡지 않음)
     """
     msg = ''
     if tr.confirmed and not tr.coast_on:
-        v_c, src = _track_coast_slope(tr)
+        v_c, src = _track_coast_slope(tr)                         # 예측 기울기는 신뢰 기준(모델·v_ref)만 사용
         if v_c < 0.0:
-            # 기준점: 마지막 실제 채택 시각. ℓ은 최근 채택값을 기울기 v_c로 옮긴 값들의 중앙값
+            # 기준점: 마지막 실제 채택 시각(또는 t_anchor). ℓ은 그 전 채택값을 기울기 v_c로 옮긴 값들의 중앙값
             # (잃기 직전 칼만 상태는 쓰레기 쪽으로 끌려가 있을 수 있음)
-            t0  = float(tr.last_accept_t)
-            pts = [(th, SOUND_SPEED / (4.0 * fh)) for th, fh in tr.hist if th >= t0 - TRACK_COAST_FIT_SEC]
+            t0  = float(tr.last_accept_t if t_anchor is None else t_anchor)
+            pts = [(th, SOUND_SPEED / (4.0 * fh)) for th, fh in tr.hist if t0 - TRACK_COAST_FIT_SEC <= th <= t0]
             if len(pts) >= 10:
                 l0 = float(np.median([lh - v_c * (th - t0) for th, lh in pts]))
             else:
@@ -1072,6 +1111,39 @@ def _track_lose(tr: _FreqTrack, t: float, why: str) -> None:
     tr.active, tr.confirmed = False, False
     tr.lost_since = t
     print(f'\n[트랙] {why} → 재탐색{msg} (t={t:.1f}s)')
+
+
+def _track_check_stall(tr: _FreqTrack, t: float) -> bool:
+    """
+    [v5.42] 정체 감지: 급수 중 공명 주파수는 멈출 수 없다. 최근 TRACK_STALL_WINDOW_SEC 동안 실제 채택값(ℓ)의 기울기가
+    기준 기울기(D/H 모델·v_ref와 바로 앞 TRACK_STALL_REF_SEC 구간 중 평평한 쪽) × TRACK_STALL_RATIO 보다 평평하면
+    공명이 아닌 피크(공명이 사라진 뒤 제자리에서 흔들리는 피크 등)를 따라가는 것으로 보고 트랙을 놓는다.
+    예측 기준점은 정체 시작 전 데이터로 잡는다. 정체로 판단하면 True.
+    """
+    if t - tr.t_conf < TRACK_STALL_WINDOW_SEC:
+        return False
+    b_trust, src_t = _track_coast_slope(tr)                     # 신뢰 기준(D/H 모델 또는 고정된 v_ref)이 있어야 판정
+    if b_trust >= 0.0:
+        return False
+    t_s = t - TRACK_STALL_WINDOW_SEC
+    win = [(th, SOUND_SPEED / (4.0 * fh)) for th, fh in tr.hist if th >= t_s]
+    if len(win) < TRACK_STALL_MIN_POINTS or win[-1][0] - win[0][0] < 0.8 * TRACK_STALL_WINDOW_SEC:
+        return False
+    ref = [(th, SOUND_SPEED / (4.0 * fh)) for th, fh in tr.hist if t_s - TRACK_STALL_REF_SEC <= th < t_s]
+    b_ref, src = b_trust, src_t
+    if len(ref) >= TRACK_STALL_MIN_POINTS and ref[-1][0] - ref[0][0] >= 0.6 * TRACK_STALL_REF_SEC:
+        _, b_loc = _theil_sen(np.array([p[0] for p in ref]), np.array([p[1] for p in ref]))
+        if b_loc > b_ref:                                         # 둘 중 평평한 쪽(오판 방지, 위가 넓은 컵은 직전 구간이 더 평평)
+            b_ref, src = min(b_loc, TRACK_STALL_REF_MIN * b_trust), '직전 구간'   # 단, 신뢰 기준의 0.6배보다 평평하게는 안 함
+    if not (TRACK_SLOPE_MIN_CM_S <= -b_ref <= TRACK_SLOPE_MAX_CM_S):
+        return False
+    _, b_w = _theil_sen(np.array([p[0] for p in win]), np.array([p[1] for p in win]))
+    if b_w <= TRACK_STALL_RATIO * b_ref:                          # 기준의 절반 이상 속도로 줄고(오르고) 있음 → 정상
+        return False
+    tr.stall_f = float(SOUND_SPEED / (4.0 * np.median([p[1] for p in win])))
+    _track_lose(tr, t, f'주파수 정체(최근 {TRACK_STALL_WINDOW_SEC:.0f}s 기울기 {b_w:.3f} / {src} {b_ref:.3f}cm/s,'
+                       f' 급수 중 공명은 멈출 수 없음)', t_anchor=t_s)
+    return True
 
 
 def _track_coast_f(tr: _FreqTrack, t: float) -> float:
@@ -1165,6 +1237,8 @@ def _track_step(chunk, t: float) -> float:
             tr.ever_confirmed = True
             f_med = float(np.median([fh for _, fh in tr.hist[-TRACK_FLOOR_MEDIAN_N:]]))
             tr.f_floor = max(tr.f_floor, f_med)                  # 한 번 튄 값으로 하한이 올라가지 않게 중앙값
+            if _track_check_stall(tr, t):                         # [v5.42] 정체 → 트랙 놓고 예측으로
+                return _track_coast_f(tr, t)
             return f
     tr.n_rej += 1
     tr.rate.append(False)
