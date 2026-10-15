@@ -2,11 +2,8 @@
 """
 gui_app.py  ─ 실험자용 GUI
 ===========================
-튜닝 패널, 실시간 주파수 그래프, 자동 라벨 저장(실측 채움률은 선택 입력)을 포함한
+튜닝 패널, 실시간 주파수 그래프, 실측 채움률 입력 기능을 포함한
 연구/개발 환경 전용 GUI.
-
-[v5.33] 급수 종료 시 자동 라벨(유량 × 밸브 열린 시간 ÷ 기준 용적)로 즉시 저장한다.
-        기준 용적 = '실측용적(mL)' 입력값(cup_info.csv에 저장) → 없으면 주파수 추정 용적.
 
 main.py 에서 --mode lab 선택 시 실행된다.
 """
@@ -17,7 +14,6 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import smart_water_core as core
 from csv_logger import save_to_csv
-import experiment_recorder as exp_rec
 
 
 def run_kiosk_gui(on_ready=None):
@@ -46,24 +42,13 @@ def run_kiosk_gui(on_ready=None):
     f_var           = ctk.StringVar(value='주파수(F) : - Hz')
     tf_var          = ctk.StringVar(value='목표(Target) : - %')
     air_var         = ctk.StringVar(value='수위(Level) : - %')
-    vol_var         = ctk.StringVar(value='급수량(Q·t) : - mL')            # [v5.33] 밸브 열린 시간 기반 급수량
     init_air_var    = ctk.StringVar(value='초기 공기층(용기 높이) : - cm')
     hit_var         = ctk.StringVar(value=f'확신(Hits) : 0/{core.STOP_TRIGGER_COUNT}')
     voice_level_var = ctk.StringVar(value='🎤 음성 목표 수위 : - %')  # 음성 설정 수위 표시
-    trial_var       = ctk.StringVar(value='Trial : 대기')
 
     def set_status(s: str):
         status_var.set(s)
         print(f'\n[GUI] {s}')
-
-    def _optional_float(entry):
-        text = entry.get().strip()
-        if not text:
-            return None
-        try:
-            return float(text)
-        except ValueError:
-            return None
 
     _pending_save = [None]
 
@@ -72,16 +57,9 @@ def run_kiosk_gui(on_ready=None):
             if core.is_filling:
                 return
 
-        # 이전 실험이 아직 저장되지 않았으면 다음 Trial 시작 금지 (v5.33부터는 종료 시 자동 저장)
-        rec_status = exp_rec.get_status()
-        if rec_status.get('pending'):
-            set_status(f"{rec_status.get('pending_trial')} 저장 후 다음 실험을 시작하세요.")
-            return
-
         line_freq.set_data([], [])
         line_detected.set_data([], [])
         line_stop.set_data([], [])
-        line_ctrl.set_data([], [])
         ax.set_xlim(0, 1)
         ax.set_ylim(core.FREQ_MIN_LIMIT, core.FREQ_MAX_LIMIT)
         target_line.set_alpha(0.0)
@@ -91,7 +69,6 @@ def run_kiosk_gui(on_ready=None):
         f_var.set('주파수(F) : - Hz')
         tf_var.set('목표(Target) : - %')
         air_var.set('수위(Level) : - %')
-        vol_var.set('급수량(Q·t) : - mL')
         init_air_var.set('초기 공기층(용기 높이) : - cm')
         hit_var.set(f'확신(Hits) : 0/{core.STOP_TRIGGER_COUNT}')
         progress.set(0.0)
@@ -103,36 +80,9 @@ def run_kiosk_gui(on_ready=None):
         except Exception:
             pass
 
-        cup_name = cup_name_entry.get().strip() or 'unknown'
-        cup_h = _optional_float(cup_height_entry)
-        cup_top_d = _optional_float(cup_top_d_entry)
-        cup_bottom_d = _optional_float(cup_bottom_d_entry)
-        cup_vol = _optional_float(cup_volume_entry)                    # [v5.33] 실측 컵 용적(mL), 선택
-        # [v5.36] 실측 용적이 있으면 용적 기준 안전 정지에 사용 (입력칸 → cup_info.csv 등록값 순)
-        core.set_cup_reference_volume(cup_vol or exp_rec.get_cup_volume_ml(cup_name))
-
         core.ensure_audio_stream()
         core.start_filling_local()
-
-        try:
-            trial_id = exp_rec.start_trial(
-                core,
-                cup_name=cup_name,
-                cup_height_cm=cup_h,
-                cup_top_diameter_cm=cup_top_d,
-                cup_bottom_diameter_cm=cup_bottom_d,
-                cup_volume_ml=cup_vol,
-                code_version='v5.36-safety-stop+exp-rec',
-                sample_interval_sec=0.20,
-            )
-            trial_var.set(f'Trial : {trial_id}')
-        except Exception as e:
-            core.solenoid_off()
-            core.stop_filling_local(save_result=False)
-            set_status(f'실험 기록 시작 실패: {e}')
-            return
-
-        set_status(f'{trial_id} → 배경 소음 측정 중...')
+        set_status('배경 소음 측정 중... (1초 후 펌프 작동)')
 
         def delayed_pump_on():
             time.sleep(core.NOISE_CALIBRATION_TIME + 0.1)
@@ -151,7 +101,6 @@ def run_kiosk_gui(on_ready=None):
 
     def on_close():
         _pending_save[0] = None
-        exp_rec.abort_trial()
         core.solenoid_off()
         try:
             import voice_module as vm
@@ -419,7 +368,7 @@ def run_kiosk_gui(on_ready=None):
     stats.pack(fill='x', pady=(0, 12))
 
     # 기존 수치 표시 항목
-    for v in [d_var, f_var, tf_var, air_var, vol_var, init_air_var, hit_var]:
+    for v in [d_var, f_var, tf_var, air_var, init_air_var, hit_var]:
         r = ctk.CTkFrame(stats, fg_color=C_CARD, corner_radius=12)
         r.pack(fill='x', pady=4)
         ctk.CTkLabel(r, textvariable=v, text_color=C_TEXT,
@@ -431,45 +380,6 @@ def run_kiosk_gui(on_ready=None):
     ctk.CTkLabel(voice_level_row, textvariable=voice_level_var,
                  text_color=C_GREEN,
                  font=('Malgun Gothic', 16, 'bold')).pack(anchor='w', padx=6)
-
-    # ── 실험 자동 기록 정보 ────────────────────────────────────────
-    exp_info = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=12)
-    exp_info.pack(fill='x', pady=(0, 8))
-
-    ctk.CTkLabel(exp_info, textvariable=trial_var, text_color=C_NAVY,
-                 font=('Malgun Gothic', 13, 'bold')).grid(
-        row=0, column=0, sticky='w', padx=(4, 10), pady=(2, 4))
-
-    ctk.CTkLabel(exp_info, text='컵 이름', text_color=C_TEXT,
-                 font=('Malgun Gothic', 11, 'bold')).grid(row=0, column=1, padx=(0, 4))
-    cup_name_entry = ctk.CTkEntry(exp_info, width=150, font=('Malgun Gothic', 11))
-    cup_name_entry.insert(0, '250mL_beaker')
-    cup_name_entry.grid(row=0, column=2, columnspan=2, padx=(0, 8), sticky='w')
-
-    ctk.CTkLabel(exp_info, text='H(cm)', text_color=C_TEXT,
-                 font=('Malgun Gothic', 11, 'bold')).grid(row=1, column=1, padx=(0, 4), pady=(0, 3))
-    cup_height_entry = ctk.CTkEntry(exp_info, width=62, placeholder_text='선택',
-                                    font=('Malgun Gothic', 11))
-    cup_height_entry.grid(row=1, column=2, padx=(0, 8), pady=(0, 3))
-
-    ctk.CTkLabel(exp_info, text='상단D', text_color=C_TEXT,
-                 font=('Malgun Gothic', 11, 'bold')).grid(row=1, column=3, padx=(0, 4), pady=(0, 3))
-    cup_top_d_entry = ctk.CTkEntry(exp_info, width=62, placeholder_text='선택',
-                                   font=('Malgun Gothic', 11))
-    cup_top_d_entry.grid(row=1, column=4, padx=(0, 8), pady=(0, 3))
-
-    ctk.CTkLabel(exp_info, text='하단D', text_color=C_TEXT,
-                 font=('Malgun Gothic', 11, 'bold')).grid(row=1, column=5, padx=(0, 4), pady=(0, 3))
-    cup_bottom_d_entry = ctk.CTkEntry(exp_info, width=62, placeholder_text='선택',
-                                      font=('Malgun Gothic', 11))
-    cup_bottom_d_entry.grid(row=1, column=6, padx=(0, 4), pady=(0, 3))
-
-    # [v5.33] 실측 컵 용적: 가장자리까지 물을 채운 무게(g) ≈ mL. 자동 라벨의 기준 용적
-    ctk.CTkLabel(exp_info, text='실측용적(mL)', text_color=C_TEXT,
-                 font=('Malgun Gothic', 11, 'bold')).grid(row=0, column=4, padx=(0, 4))
-    cup_volume_entry = ctk.CTkEntry(exp_info, width=62, placeholder_text='선택',
-                                    font=('Malgun Gothic', 11))
-    cup_volume_entry.grid(row=0, column=5, padx=(0, 8), pady=(2, 4))
 
     plot_frame = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)
     plot_frame.pack(fill='both', expand=True)
@@ -484,7 +394,7 @@ def run_kiosk_gui(on_ready=None):
 
     actual_air_frame = ctk.CTkFrame(graph_header, fg_color=C_CARD)
 
-    ctk.CTkLabel(actual_air_frame, text='실측(선택, %):',
+    ctk.CTkLabel(actual_air_frame, text='실제 채움률(%):',
                  text_color=C_NAVY,
                  font=('Malgun Gothic', 12, 'bold')
                  ).pack(side='left', padx=(14, 4))
@@ -494,32 +404,53 @@ def run_kiosk_gui(on_ready=None):
                                     font=('Malgun Gothic', 12))
     actual_air_entry.pack(side='left', padx=(0, 6))
 
+    ctk.CTkLabel(actual_air_frame, text='컵:',
+                 text_color=C_NAVY,
+                 font=('Malgun Gothic', 12, 'bold')
+                 ).pack(side='left', padx=(4, 4))
+
+    cup_type_entry = ctk.CTkEntry(actual_air_frame, width=105,
+                                  placeholder_text='250mL_beaker',
+                                  font=('Malgun Gothic', 12))
+    cup_type_entry.insert(0, '250mL_beaker')
+    cup_type_entry.pack(side='left', padx=(0, 6))
+
     def on_confirm_save():
-        """[v5.33] 자동 저장된 Trial 행에 실측 채움률(선택)을 덧붙인다. 자동 라벨 검증용."""
         data = _pending_save[0]
         if data is None:
             return
         raw = actual_air_entry.get().strip()
         try:
-            fill_pct_input = max(0.0, min(100.0, float(raw)))
-        except ValueError:
-            set_status('실측 채움률은 숫자로 입력하세요. 예) 75.0')
-            return
-        init_air = data.get('init_air', 0.0)
-        actual_air = (1.0 - fill_pct_input / 100.0) * init_air if init_air > 0 else None  # % → cm 역변환
-        try:
-            if exp_rec.update_manual_label(data['trial_id'], fill_pct_input, actual_air_cm=actual_air):
-                trial_var.set(f"Trial : {data['trial_id']} 실측 {fill_pct_input:.1f}% 기록")
-                set_status('실측 채움률 기록 완료')
+            fill_pct_input = float(raw)
+            fill_pct_input = max(0.0, min(100.0, fill_pct_input))
+            init_air       = data.get('init_air', 0.0)
+            if init_air > 0:
+                actual_air = (1.0 - fill_pct_input / 100.0) * init_air  # % → cm 역변환
             else:
-                set_status('실측 채움률 기록 실패 (Trial 행을 찾지 못함)')
-        except Exception as e:
-            print(f'\n[REC 실측 기록 오류] {e}')
-            set_status(f'실측 채움률 기록 오류: {e}')
-            return
+                actual_air = None
+        except ValueError:
+            fill_pct_input = None
+            actual_air = None
+        cup_type = cup_type_entry.get().strip() or 'unknown'
+        save_to_csv(
+            data['d'], data['init_f'], data['tf'], data['sf'],
+            r2_final=data['r2'],
+            total_samples=data['total_samples'],
+            theory_intercept=data['theory_intercept'],
+            stand_type='filled_box',
+            stand_height_cm=3.0,
+            actual_air_cm=actual_air,
+            estimated_stop_air_cm=data.get('stop_air', None),
+            init_air_len_cm=data.get('init_air', 0.0),
+            actual_fill_pct=fill_pct_input,
+            cup_type=cup_type,
+            target_fill_pct=data.get('target_pct', core.TARGET_FILL_PCT),
+            stop_elapsed_sec=data.get('stop_elapsed_sec', None),
+        )
         _pending_save[0] = None
         actual_air_frame.pack_forget()
         actual_air_entry.delete(0, 'end')
+        set_status('저장 완료')
 
     ctk.CTkButton(actual_air_frame, text='저장', width=60, height=28,
                   fg_color=C_NAVY, hover_color=C_NAVY_HOVER,
@@ -536,7 +467,6 @@ def run_kiosk_gui(on_ready=None):
     line_freq,     = ax.plot([], [], linewidth=1.7, label='3rd_freq')
     line_stop,     = ax.plot([], [], linewidth=1.2, linestyle='-.', alpha=0.85, label='2nd_freq')
     line_detected, = ax.plot([], [], linewidth=1.0, alpha=0.70, label='1st_freq')
-    line_ctrl,     = ax.plot([], [], linewidth=1.5, linestyle='--', label='ctrl_freq')   # [v5.33] 제어용 1초 중앙값
     target_line = ax.axhline(y=0, linestyle='--', alpha=0.8, label='target_f')
     ax.legend(loc='upper left', fontsize=8)
     canvas = FigureCanvasTkAgg(fig, master=plot_frame)
@@ -561,12 +491,8 @@ def run_kiosk_gui(on_ready=None):
                 f_list        = list(core.history_freq)
                 detected_list = list(getattr(core, 'history_detected_freq', []))
                 stop_list     = list(getattr(core, 'history_stop_freq', []))
-                ctrl_list     = list(getattr(core, 'history_ctrl_freq', []))
                 t_mode        = bool(core.tracking_mode)
                 init_air_c    = float(core.init_air_len_cm)
-                cup_vol_c     = float(core.cup_volume_ml)
-                fill_ml_c     = float(core.last_fill_volume_ml)
-            poured_ml_c = core.poured_volume_ml()
 
             d_var.set(f'지름(D) : {d:.2f} cm' if d > 0 else '지름(D) : - cm')
             f_var.set(f'주파수(F) : {sf:.0f} Hz' if sf > 0 else '주파수(F) : - Hz')
@@ -574,12 +500,11 @@ def run_kiosk_gui(on_ready=None):
             # [PCT] 목표 수위: core.TARGET_FILL_PCT 직접 사용
             tf_var.set(f'목표(Target) : {core.TARGET_FILL_PCT:.1f} %' if tf > 0 else '목표(Target) : - %')
 
-            # [v5.33-VOLUME] 현재 수위: mL 기준 % (채운 mL / 컵 용적 mL)
-            if init_air_c > 0 and fill_pct > 0 and cup_vol_c > 0:
-                air_var.set(f'수위(Level) : {fill_pct:.1f} % ({fill_ml_c:.0f}/{cup_vol_c:.0f} mL)')
+            # [PCT] 현재 수위
+            if init_air_c > 0 and fill_pct > 0:
+                air_var.set(f'수위(Level) : {fill_pct:.1f} %')
             else:
                 air_var.set('수위(Level) : - %')
-            vol_var.set(f'급수량(Q·t) : {poured_ml_c:.0f} mL' if poured_ml_c > 0 else '급수량(Q·t) : - mL')
 
             if _init_air_fixed[0] is None and init_air_c > 0:
                 _init_air_fixed[0] = init_air_c
@@ -612,20 +537,13 @@ def run_kiosk_gui(on_ready=None):
                         stop_plot = []
                         line_stop.set_data([], [])
 
-                    if len(ctrl_list) >= n_plot:
-                        ctrl_plot = ctrl_list[-n_plot:]
-                        line_ctrl.set_data(t_list, ctrl_plot)
-                    else:
-                        ctrl_plot = []
-                        line_ctrl.set_data([], [])
-
                     line_freq.set_data(t_list, f_list)
 
                     t_max = max(t_list)
                     ax.set_xlim(max(0, t_max - 30), max(5, t_max))
 
                     y_values = []
-                    for arr in (f_list, detected_plot, stop_plot, ctrl_plot):
+                    for arr in (f_list, detected_plot, stop_plot):
                         y_values.extend([float(v) for v in arr if v is not None and float(v) > 0])
                     if tf > 0:
                         y_values.append(float(tf))
@@ -644,7 +562,6 @@ def run_kiosk_gui(on_ready=None):
                 line_freq.set_data([], [])
                 line_detected.set_data([], [])
                 line_stop.set_data([], [])
-                line_ctrl.set_data([], [])
                 ax.set_xlim(0, 1)
                 ax.set_ylim(core.FREQ_MIN_LIMIT, core.FREQ_MAX_LIMIT)
                 target_line.set_alpha(0.0)
@@ -652,6 +569,8 @@ def run_kiosk_gui(on_ready=None):
             canvas.draw_idle()
 
             if finish:
+                set_status('측정 완료 → 실제 채움률(%) 입력 후 저장')
+
                 with core.lock:
                     init_f_save      = float(core.initial_stable_freq)
                     r2               = float(core.last_r2)
@@ -661,52 +580,25 @@ def run_kiosk_gui(on_ready=None):
                     stop_air_save    = float(core.last_current_air)
                     target_pct_save  = float(core.TARGET_FILL_PCT)
                     stop_elapsed_sec = float(getattr(core, 'last_stop_elapsed_sec', 0.0))
-                    cup_vol_est      = float(core.cup_volume_ml)
 
                 total_samples = len(freq_snapshot)
                 print(f'\n[DEBUG] 샘플수={total_samples} | R2={r2}')
 
-                # [v5.33] 기준 용적: 입력칸 → cup_info.csv 등록값 → (없으면 추정 용적)
-                cup_name = cup_name_entry.get().strip() or 'unknown'
-                cup_ref_ml = _optional_float(cup_volume_entry) or exp_rec.get_cup_volume_ml(cup_name)
-                label_pct, label_src, _ = core.compute_label_pct(core.poured_volume_ml(), cup_ref_ml, cup_vol_est)
-
-                # 급수 종료 시 시계열 + core 최종 상태 저장 → 자동 라벨로 trial_summary 즉시 저장
-                finished_trial = None
-                try:
-                    finished_trial = exp_rec.capture_finish(core)
-                    if finished_trial:
-                        exp_rec.finalize_trial(core)
-                except Exception as e:
-                    print(f'\n[REC 자동 저장 오류] {e}')
-
-                save_to_csv(
-                    d, init_f_save, tf, sf,
-                    r2_final=r2,
-                    total_samples=total_samples,
-                    theory_intercept=t_intercept_s,
-                    estimated_stop_air_cm=stop_air_save,
-                    init_air_len_cm=init_air_save,
-                    cup_type=cup_name,
-                    target_fill_pct=target_pct_save,
-                    stop_elapsed_sec=stop_elapsed_sec,
-                    cup_volume_ref_ml=cup_ref_ml,
-                )
-
-                label_txt = '-' if label_pct is None else f'{label_pct:.1f}%'
-                src_txt = {'measured_cup_volume': '실측용적', 'estimated_cup_volume': '추정용적'}.get(label_src, '없음')
-                if finished_trial:
-                    trial_var.set(f'Trial : {finished_trial} 자동 저장 (라벨 {label_txt}, {src_txt})')
-                    _pending_save[0] = {'trial_id': finished_trial, 'init_air': init_air_save}
-                    actual_air_entry.delete(0, 'end')
-                    actual_air_frame.pack(side='right')                # 실측값 입력은 선택 사항
-                stop_reason = str(getattr(core, 'last_stop_reason', '') or '')
-                if stop_reason.startswith('safety'):
-                    reason_txt = {'safety_no_model': '모델 미확정', 'safety_max_time': '최대 급수 시간 초과',
-                                  'safety_volume': '실측 용적 기준 초과'}.get(stop_reason, stop_reason)
-                    set_status(f'⚠ 안전 정지({reason_txt}) → 라벨 {label_txt} 저장, 데이터 확인 필요')
-                else:
-                    set_status(f'측정 완료 → 자동 라벨 {label_txt} 저장 (실측값 입력은 선택)')
+                _pending_save[0] = {
+                    'd':                d,
+                    'init_f':           init_f_save,
+                    'tf':               tf,
+                    'sf':               sf,
+                    'r2':               r2,
+                    'total_samples':    total_samples,
+                    'theory_intercept': t_intercept_s,
+                    'init_air':         init_air_save,
+                    'stop_air':         stop_air_save,
+                    'target_pct':       target_pct_save,
+                    'stop_elapsed_sec': stop_elapsed_sec,
+                }
+                actual_air_entry.delete(0, 'end')
+                actual_air_frame.pack(side='right')
 
                 _init_air_fixed[0] = None
                 init_air_var.set('초기 공기층(용기 높이) : - cm')

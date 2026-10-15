@@ -20,6 +20,7 @@ import os
 import signal
 import asyncio
 import subprocess
+import shutil
 import collections
 import threading
 import difflib
@@ -57,6 +58,7 @@ NOISE_PROP_DECREASE = 0.25    # noisereduce 강도. 0.35보다 말소리 왜곡�
 VOICE_READ_FAIL_LIMIT = 3     # 마이크 read 연속 실패 시 voice_loop 재시작 유도
 
 COMMAND_TIMEOUT    = 20.0   # 호출어 인식 후 다음 명령 대기 시간
+LOCATION_TIMEOUT   = COMMAND_TIMEOUT  # 기존 코드 호환용
 CUP_FOUND_TIMEOUT  = 35.0
 CUP_POLL_INTERVAL  = 0.5
 ARRIVAL_TIMEOUT    = 40.0
@@ -106,6 +108,13 @@ _vad_model_lock = threading.Lock()
 # 정상 상태에서는 항상 1이어야 한다. 2 이상이면 중복 실행(watchdog 재시작) 의심.
 _voice_loop_active_count = 0
 _voice_loop_count_lock = threading.Lock()
+
+
+def get_voice_loop_active_count() -> int:
+    """현재 살아 있는 voice_loop 인스턴스 수(진단용)."""
+    with _voice_loop_count_lock:
+        return int(_voice_loop_active_count)
+
 
 
 def _get_vad_model():
@@ -398,6 +407,11 @@ def voice_stop_water():
     log_info('[급수] 정지 요청')
 
 
+def is_water_target_reached() -> bool:
+    import smart_water_core as core
+    with core.lock:
+        return bool(core.request_finish)
+
 # ════════════════════════════════════════════════════════════════════
 #  ESP32 컵 위치 알림
 # ════════════════════════════════════════════════════════════════════
@@ -476,6 +490,7 @@ def _voice_ready_gui_state(ready=None, text=None, remain_sec=None):
                 core.voice_ready = bool(ready)                   # True이면 실제 음성 입력 대기 상태
             if text is not None:
                 core.voice_ready_text = str(text)                # GUI에 표시할 대기/처리 상태 문구
+                core.voice_ready_time = time.time()              # 마지막 상태 갱신 시각
             if remain_sec is not None:
                 # 발화 대기 중 남은 시간(초). 음수 방지. -1이면 '표시 안 함' 의미로 사용.
                 core.voice_remain_sec = float(remain_sec)        # GUI 카운트다운 표시용 남은 시간
@@ -669,6 +684,7 @@ def _voice_gui_state(active=None, volume=None, text=None):
                 core.mic_volume = max(0.0, min(1.0, float(volume)))
             if text is not None:
                 core.last_recognized_text = str(text)
+                core.last_recognized_time = time.time()
     except Exception as e:
         log_dbg(f'음성 GUI 상태 갱신 오류: {e}')
 
@@ -1168,6 +1184,20 @@ def _replace_display_tokens(text: str) -> str:
         out.append(prefix + (replaced if replaced is not None else token) + suffix)
 
     return _clean_display_spaces(''.join(out))
+
+
+def normalize_display_text(text: str) -> str:
+    """
+    STT 원문을 사용자 GUI 표시용 문장으로 정리한다.
+    내부 명령 판정에는 영향 없음.
+    """
+    if not text:
+        return ''
+
+    shown = str(text).strip()
+    shown = _replace_display_phrases(shown)
+    shown = _replace_display_tokens(shown)
+    return _clean_display_spaces(shown)
 
 
 def voice_display_text(text):
