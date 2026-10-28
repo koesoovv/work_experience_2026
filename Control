@@ -1,4 +1,16 @@
-# smart_water_core.py  ── v5.51-hybrid-ridge
+# smart_water_core.py  ── v5.52-early-height
+#
+# [v5.52-EARLY-HEIGHT] 높이(초기 공기층)·지름을 물이 닿은 직후 공명선으로 바로 확정 → 수위 표시를 3~5초 앞당김
+#   기존: 6.85s 주파수로 높이(+보정값 1.7~5.6cm), 그 뒤 회귀로 지름 → 수위 표시가 급수 후 약 9~10s
+#   변경: ① 물 도착 감지(급수 전 3초 대비 소리 크기 EARLY_ARRIVAL_DB 이상 상승이 EARLY_ARRIVAL_N 청크 연속)
+#         ② 도착 후 EARLY_FIT_SKIP_SEC~EARLY_FIT_SEC 공명선을 ℓ=c/(4f) 직선(Theil–Sen)으로 맞춤
+#            ℓ0 = 도착 순간 값(빈 컵), 기울기 → 지름 D0 = √(4Q/(π·|dℓ/dt|))
+#         ③ 높이 H = ℓ0 − 0.35·D0 + EARLY_H_ADD_CM. 기존 보정값은 '6.85s까지 찬 물'을 메우던 부분이 빠지고
+#            원통 공식 차이만 남아 작아짐(녹음 10회 재생: +2.0cm에서 멈춘 순간 수위 오차 평균 2.1%p, v5.51 재생 2.9%p)
+#         ④ 지름은 D0로 고정(회귀로 바꾸지 않음 — 높이와 같은 직선에서 나온 짝이라 바뀌면 수위가 틀어짐)
+#         ⑤ 초기 주파수(하류 기준값)는 같은 직선의 6.85s 예측값으로 넣어 기존 문턱(트래킹 모드 등) 의미 유지
+#   실패 시(도착 감지·직선 맞춤 실패) 기존 v5.51 방식(6.85s 초기 주파수 + 회귀 지름)으로 자동 진행
+#   EARLY_HD_ENABLE = False 로 두면 v5.51과 동일
 #
 # [v5.51-HYBRID-RIDGE] (AI_before = v5.32 기준) 추정 수위 50% 전까지만 '공명선 추적'으로 검출, 그 뒤는 원본 그대로
 #   녹음 12회(유리머그·플라스틱 머그·편의점 컵·꽃분모자, 장비 CSV와 같은 회차) 분석:
@@ -260,6 +272,19 @@ DEVICE_TONES_HZ    = [431.0, 506.0, 829.0, 1163.0, 1475.0, 2024.0, 2487.0]   # �
 DEVICE_TONE_TOL_HZ = 15.0    # 공명선 점수에서 빼는 폭(±Hz). 원본 검출은 noise_profile 기준(±25Hz) 그대로
 if RIDGE_ENABLE:
     SPLASH_GUARD_TIME = 0.0  # [v5.51] 가드 제거(물이 닿는 순간부터 검출). 장비 고정음은 위 목록으로 제외
+
+# ── [v5.52-EARLY-HEIGHT] 물 도착 직후 높이·지름 확정 ─────────────────
+EARLY_HD_ENABLE    = True    # False: v5.51과 동일(6.85s 초기 주파수 + 회귀 지름)
+EARLY_ARRIVAL_DB   = 12.0    # 물 도착 판정: 급수 전 3초 소리 크기(중앙값)보다 이만큼(dB) 커진 청크가 연속
+EARLY_ARRIVAL_N    = 4       # 물 도착 판정 연속 청크 수(≈0.37s). 3이면 밸브 여는 '딸깍'(약 0.2s)을 물 도착으로 오인
+EARLY_BASE_DB      = -45.0   # 급수 전 소리를 못 쟀을 때 기준(조용한 청크는 원본에서 버려짐: 최대값 0.01 ≈ -45dB)
+EARLY_FIT_SKIP_SEC = 0.5     # 도착 직후 이 시간은 직선 맞춤에서 제외(물줄기가 자리 잡는 구간)
+EARLY_FIT_SEC      = 4.0     # 도착 후 이 시간까지의 공명선으로 직선 맞춤 → 이 시점에 높이·지름 확정
+EARLY_FIT_MIN_N    = 15      # 직선 맞춤 최소 점 수
+EARLY_H_ADD_CM     = 2.0     # 높이 보정값(cm). 녹음 10회 재생, 멈춘 순간 수위 오차: +1.5→3.0%p, +2.0→2.1%p, +2.5→2.3%p
+EARLY_GIVEUP_SEC   = 6.0     # 도착 후 이 시간까지 확정 못 하면 기존 방식으로 진행
+if RIDGE_ENABLE and EARLY_HD_ENABLE:
+    CONTROL_START_TIME = 0.0 # [v5.52] 높이·지름이 확정되는 즉시 수위 계산(기존 7초 대기 제거)
 RIDGE_BAND_LO      = 300.0   # 돌출도 계산 대역(Hz)
 RIDGE_BAND_HI      = 3000.0
 RIDGE_F_LO         = 600.0   # 공명선 탐색 범위(Hz). 녹음 5개의 시작 공명 657~872Hz
@@ -549,6 +574,38 @@ _ridge_t     = deque(maxlen=_RIDGE_NMAX)   # 청크 시각(filling_elapsed)
 _ridge_p     = deque(maxlen=_RIDGE_NMAX)   # 청크별 돌출도(dB) 배열
 _ridge_path  = (np.empty(0), np.empty(0))  # 최근 계산한 경로 (시각 배열, 주파수 배열)
 _hyb_switched = False                       # [v5.51] 추정 수위 HYB_SWITCH_PCT 이후 원본 검출로 전환됨
+_early_base   = []                          # [v5.52] 급수 전 청크 소리 크기(dB)
+_early_run    = 0                           # [v5.52] 기준보다 큰 청크 연속 수
+_early_t_arr  = -1.0                        # [v5.52] 물 도착 시각(filling_elapsed), 미감지 -1
+_early_state  = 'wait'                      # [v5.52] wait → arrived → done / fail
+_early_d_lock = False                       # [v5.52] 지름을 초반 직선 값으로 고정했는지
+
+
+def _chunk_db(chunk) -> float:
+    """청크 소리 크기(dB, RMS)."""
+    return float(20.0 * np.log10(np.sqrt(np.mean(np.square(chunk))) + 1e-12))
+
+
+def _early_fit(t_arr: float):
+    """
+    [v5.52] 도착 후 공명선(EARLY_FIT_SKIP_SEC~EARLY_FIT_SEC)을 ℓ=c/(4f) 직선으로 맞춤(Theil–Sen).
+    반환: (ℓ0 = 도착 순간 값, 기울기 dℓ/dt) — 점이 부족하거나 기울기가 물리 범위 밖이면 None
+    """
+    T, F = _ridge_path
+    q = (T >= t_arr + EARLY_FIT_SKIP_SEC) & (T <= t_arr + EARLY_FIT_SEC) & (F > 0)
+    if q.sum() < EARLY_FIT_MIN_N:
+        return None
+    tt = T[q] - t_arr
+    ll = SOUND_SPEED / (4.0 * F[q])
+    i, j = np.triu_indices(len(tt), 1)
+    ok = (tt[j] - tt[i]) > 0.3
+    if not ok.any():
+        return None
+    v  = float(np.median((ll[j][ok] - ll[i][ok]) / (tt[j][ok] - tt[i][ok])))
+    l0 = float(np.median(ll - v * tt))
+    if not (INIT_RISE_MIN_CM_S <= -v <= INIT_RISE_MAX_CM_S):
+        return None
+    return l0, v
 
 
 def _ridge_reset() -> None:
@@ -892,7 +949,9 @@ def _regression_worker():
             mad_D = float(np.median(np.abs(cand_arr - med_D))) if len(cand_arr) > 0 else 0.0
             last_d_candidate_median = med_D
             last_d_candidate_mad    = mad_D
-            if current_diameter == 0:
+            if _early_d_lock:
+                pass                             # [v5.52] 초반 직선 지름 고정(높이와 짝)
+            elif current_diameter == 0:
                 current_diameter = med_D
             else:
                 current_diameter = current_diameter * DIAM_EMA_KEEP + med_D * DIAM_EMA_NEW
@@ -981,6 +1040,7 @@ def start_filling_local() -> None:
     global bridge_active, bridge_start_elapsed, bridge_start_fill_pct, bridge_pred_fill_pct
     global bridge_start_q, bridge_start_freq, bridge_eta_sec, bridge_last_log
     global _hyb_switched
+    global _early_base, _early_run, _early_t_arr, _early_state, _early_d_lock
 
     with lock:
         is_filling              = True
@@ -1052,6 +1112,11 @@ def start_filling_local() -> None:
         bridge_last_log         = 0.0
         _ridge_reset()                       # [v5.50-RIDGE-TRACK]
         _hyb_switched           = False      # [v5.51] 원본 검출로 전환됐는지
+        _early_base             = []         # [v5.52]
+        _early_run              = 0
+        _early_t_arr            = -1.0
+        _early_state            = 'wait'
+        _early_d_lock           = False
         if DEVICE_TONE_ENABLE:
             noise_profile.extend(DEVICE_TONES_HZ)   # [v5.51] 원본 검출(LPC/FFT)에서도 고정음 근처 피크 제외
     print('\n>>> [1단계] 배경 소음 측정 (3초)...')
@@ -1100,6 +1165,7 @@ def audio_callback(indata, frames, time_info, status):
     global bridge_active, bridge_start_elapsed, bridge_start_fill_pct, bridge_pred_fill_pct
     global bridge_start_q, bridge_start_freq, bridge_eta_sec, bridge_last_log
     global _hyb_switched
+    global _early_base, _early_run, _early_t_arr, _early_state, _early_d_lock
 
     if not is_filling:
         return
@@ -1115,6 +1181,7 @@ def audio_callback(indata, frames, time_info, status):
 
         # ── 1단계: 배경 소음 수집 + 노이즈 플로어 측정 ──────────────
         if elapsed < NOISE_CALIBRATION_TIME:
+            _early_base.append(_chunk_db(chunk))     # [v5.52] 물 도착 판정 기준
             windowed = chunk * np.hamming(len(chunk))
             fft_val  = np.abs(np.fft.rfft(windowed))
             freqs    = np.fft.rfftfreq(len(chunk), d=1.0 / SAMPLE_RATE)
@@ -1138,6 +1205,45 @@ def audio_callback(indata, frames, time_info, status):
         # ── [v5.50-RIDGE-TRACK] 공명선 누적·경로 계산 (가드 구간 포함 매 청크) ──
         if RIDGE_ENABLE:
             _ridge_push(chunk, filling_elapsed)
+
+        # ── [v5.52-EARLY-HEIGHT] 물 도착 감지 → 도착 후 EARLY_FIT_SEC에 높이·지름 확정 ──
+        if RIDGE_ENABLE and EARLY_HD_ENABLE and _early_state in ('wait', 'arrived'):
+            if _early_state == 'wait':
+                base = float(np.median(_early_base)) if len(_early_base) >= 3 else EARLY_BASE_DB
+                _early_run = _early_run + 1 if _chunk_db(chunk) >= base + EARLY_ARRIVAL_DB else 0
+                if _early_run >= EARLY_ARRIVAL_N:
+                    _early_t_arr = max(0.0, filling_elapsed - (EARLY_ARRIVAL_N - 1) * CHUNK_SIZE / SAMPLE_RATE)
+                    _early_state = 'arrived'
+                    print(f'\n[v5.52] 물 도착 감지 t={_early_t_arr:.2f}s (기준 {base:.1f}dB)')
+            elif filling_elapsed >= _early_t_arr + EARLY_FIT_SEC:
+                fit = _early_fit(_early_t_arr)
+                if fit is not None:
+                    l0, v = fit
+                    d0 = float(np.sqrt(4.0 * DIAMETER_EST_FLOW_RATE / (np.pi * -v)))
+                    h0 = l0 - END_CORRECTION_K * d0 + EARLY_H_ADD_CM
+                    if 3.0 <= d0 <= 15.0 and 5.5 <= h0 <= 16.0:
+                        l_ref = l0 + v * (INIT_REF_TIME - _early_t_arr)          # 같은 직선의 6.85s 값(하류 기준용)
+                        with lock:
+                            initial_stable_freq     = float(SOUND_SPEED / (4.0 * max(0.5, l_ref)))
+                            initial_stable_time     = float(INIT_REF_TIME)
+                            current_diameter        = d0
+                            last_d_locked_cm        = d0
+                            _early_d_lock           = True
+                            init_air_len_cm         = h0
+                            last_init_air_locked_cm = h0
+                            last_init_air_by_initfreq_cm = h0
+                            _eff_target_air_cm      = max(0.5, h0 * (1.0 - TARGET_FILL_PCT / 100.0))
+                            target_freq             = SOUND_SPEED / (4.0 * (_eff_target_air_cm + END_CORRECTION_K * d0))
+                            calibration_done        = True
+                            last_model_valid        = True
+                            last_reject_reason      = 'ok'
+                        _early_state = 'done'
+                        print(f'\n[★ v5.52 초반 확정] t={filling_elapsed:.1f}s (도착 후 {filling_elapsed - _early_t_arr:.1f}s)'
+                              f' | ℓ0={l0:.2f}cm 기울기={v:.3f}cm/s → 지름 {d0:.2f}cm, 높이 {h0:.2f}cm'
+                              f' (보정 +{EARLY_H_ADD_CM:.1f}) | 목표 {target_freq:.0f}Hz')
+                if _early_state != 'done' and filling_elapsed >= _early_t_arr + EARLY_GIVEUP_SEC:
+                    _early_state = 'fail'
+                    print(f'\n[v5.52] 초반 확정 실패 → 기존 방식(6.85s 초기 주파수 + 회귀 지름)으로 진행')
 
         # ── 2단계: SPLASH 구간 펌프 소음 보완 ──────────────────────
         if filling_elapsed < SPLASH_GUARD_TIME:
