@@ -1,4 +1,19 @@
-# smart_water_core.py  ── v5.32-time-q-bridge
+# smart_water_core.py  ── v5.51-hybrid-ridge
+#
+# [v5.51-HYBRID-RIDGE] (AI_before = v5.32 기준) 추정 수위 50% 전까지만 '공명선 추적'으로 검출, 그 뒤는 원본 그대로
+#   녹음 12회(유리머그·플라스틱 머그·편의점 컵·꽃분모자, 장비 CSV와 같은 회차) 분석:
+#     - 50% 아래 구간의 33~44%를 6초 가드가 막고 있었고(검출 없음), 검출 구간의 20%는 장비 고정음
+#       (431·506·829·1163·1475·2024·2487Hz, 컵과 무관하게 매번 같은 자리)을 공명으로 잡음
+#     - 한순간의 특징(3배음·피크 폭)으로는 공명이 구분되지 않고, '시간에 따라 끊기지 않고 올라가는 선'만 구분됨
+#   ① 가드 제거: 물이 닿는 순간부터 검출(SPLASH_GUARD_TIME = 0, RIDGE_ENABLE일 때만)
+#   ② 50% 전 검출: 같은 순간 주변 주파수 대비 돌출도(넓은 물소리 제거) + 최근 RIDGE_WINDOW_SEC 동안
+#      끊기지 않고 올라가는 선(Viterbi 경로)의 끝값. 추정 수위가 HYB_SWITCH_PCT를 한 번 넘으면 원본(LPC/FFT)으로 전환
+#   ③ 장비 고정음: DEVICE_TONES_HZ 자리를 공명선 점수에서 빼고, 원본 소음 목록(noise_profile)에도 넣어 50% 이후에도 제외
+#   ④ 초기 주파수: 공명선(INIT_FIT_FROM~6.85+INIT_LAG_SEC)을 강건 직선(Theil–Sen)으로 맞춘 6.85s 값,
+#      그 직선이 실제로 올라가고 있을 때만 확정. 기존 H 보정값(INIT_OFFSET_*)이 6.85s 기준이라 시점 유지
+#   녹음 재생 결과(공명 ±5% 이내): 물 도착~6s 없음 → 92%, 6s~50% 69% → 76%, 50%~정지 48% → 48%(원본과 동일)
+#   RIDGE_ENABLE=False + DEVICE_TONE_ENABLE=False 로 두면 원본(v5.32)과 완전히 같게 동작
+#   그 외(평활·D 회귀·정지 판단·브릿지)는 변경 없음
 #
 # [v5.32-TIME-Q-BRIDGE] 70% 이후 시간/유량 예측 브릿지 추가
 #   80~90% 고수위 목표에서 주파수 검출이 1800~2000Hz 부근에서 정체될 때,
@@ -236,6 +251,32 @@ BUF_SIZE_FINAL = 3
 
 # ── init_stable 최소 주파수 ──────────────────────────────────────────
 INIT_STABLE_MIN_HZ = 350
+
+# ── [v5.50-RIDGE-TRACK] 공명선 추적 ──────────────────────────────────
+RIDGE_ENABLE       = True    # False: 기존(v5.32) LPC/FFT 검출 + 기존 초기 주파수 방식 + 6초 가드
+HYB_SWITCH_PCT     = 50.0    # 추정 수위가 이 값을 한 번 넘으면 원본 검출(LPC/FFT)로 전환(이후 유지)
+DEVICE_TONE_ENABLE = True    # 장비 고정음 제외 사용
+DEVICE_TONES_HZ    = [431.0, 506.0, 829.0, 1163.0, 1475.0, 2024.0, 2487.0]   # 녹음 17회에서 컵과 무관하게 반복된 고정음
+DEVICE_TONE_TOL_HZ = 15.0    # 공명선 점수에서 빼는 폭(±Hz). 원본 검출은 noise_profile 기준(±25Hz) 그대로
+if RIDGE_ENABLE:
+    SPLASH_GUARD_TIME = 0.0  # [v5.51] 가드 제거(물이 닿는 순간부터 검출). 장비 고정음은 위 목록으로 제외
+RIDGE_BAND_LO      = 300.0   # 돌출도 계산 대역(Hz)
+RIDGE_BAND_HI      = 3000.0
+RIDGE_F_LO         = 600.0   # 공명선 탐색 범위(Hz). 녹음 5개의 시작 공명 657~872Hz
+RIDGE_F_HI         = 2600.0
+RIDGE_NEIGH_BINS   = 12      # 주변 비교 폭(±12bin ≈ ±130Hz). 물소리 대역처럼 넓은 덩어리는 지워지고 좁은 공명 피크만 남음
+RIDGE_CLIP_DB      = -5.0    # 돌출도 하한(dB). 주변보다 낮은 곳은 이 값으로 고정(경로 점수에 과한 벌점 방지)
+RIDGE_WINDOW_SEC   = 6.0     # 연속 경로를 찾는 최근 구간(s)
+RIDGE_VMAX_CM_S    = 0.8     # 청크당 허용 상승폭의 기준: 음향 길이 감소 속도 상한(cm/s). Q=15mL/s면 지름 ≈4.9cm 컵
+                             # 허용 상승(Hz/청크) = 4f²/c × RIDGE_VMAX_CM_S × 청크 길이 → 저주파일수록 작게(최소 1bin)
+RIDGE_DOWN_PEN     = 3.0     # 1bin 하강 허용 시 벌점(dB). 측정 흔들림만 허용
+RIDGE_START_SEC    = 1.0     # 급수 시작 후 이 시간부터 경로 계산(물줄기가 닿기 전 구간 제외)
+INIT_REF_TIME      = 6.85    # 초기 주파수 기준 시각(s). 실험 494회 모두 6.85±0.01s에 확정 → H 보정값 기준
+INIT_LAG_SEC       = 1.0     # 기준 시각 뒤 이만큼 더 듣고 확정(경로 끝값보다 뒤 데이터로 확정된 값이 정확함)
+INIT_FIT_FROM      = 2.0     # 초기 주파수 직선 맞춤 시작 시각(s). 물줄기가 자리 잡기 전 구간 제외
+INIT_RISE_MIN_CM_S = 0.08    # 상승 확인: 음향 길이 감소 속도 하한(cm/s). Q=15mL/s·지름 15cm 컵
+INIT_RISE_MAX_CM_S = 2.0     # 상한(cm/s). 지름 3cm 컵
+INIT_GIVEUP_SEC    = 10.0    # 이 시각까지 상승 확인이 안 되면 경고 후 그대로 확정
 
 # ── 기타 ────────────────────────────────────────────────────────────
 MIN_SLOPE_CUTOFF = 16 * FLOW_RATE / (np.pi * SOUND_SPEED * 15.0**2) * 0.3
@@ -482,6 +523,110 @@ def levinson_durbin(r, order):
         a[k]  = lam
         e    *= max(1.0 - lam * lam, 1e-12)
     return a
+
+
+# ════════════════════════════════════════════════════════════════════
+#  [v5.50-RIDGE-TRACK] 공명선 추적
+# ════════════════════════════════════════════════════════════════════
+_RIDGE_FREQS = np.fft.rfftfreq(CHUNK_SIZE, d=1.0 / SAMPLE_RATE)
+_RIDGE_BAND  = (_RIDGE_FREQS >= RIDGE_BAND_LO) & (_RIDGE_FREQS <= RIDGE_BAND_HI)
+_RIDGE_SEL   = (_RIDGE_FREQS[_RIDGE_BAND] >= RIDGE_F_LO) & (_RIDGE_FREQS[_RIDGE_BAND] <= RIDGE_F_HI)
+_RIDGE_F     = _RIDGE_FREQS[_RIDGE_BAND][_RIDGE_SEL]          # 경로 탐색 주파수 축
+_RIDGE_WIN   = np.hanning(CHUNK_SIZE)
+_RIDGE_TONE_MASK = np.array([DEVICE_TONE_ENABLE and min(abs(f - t) for t in DEVICE_TONES_HZ) <= DEVICE_TONE_TOL_HZ
+                             for f in _RIDGE_FREQS[_RIDGE_BAND][_RIDGE_SEL]], dtype=bool)   # 고정음 자리 bin
+_RIDGE_NMAX  = max(8, int(RIDGE_WINDOW_SEC * SAMPLE_RATE / CHUNK_SIZE))
+_RIDGE_STEP  = np.maximum(1, np.ceil(4.0 * _RIDGE_F ** 2 / SOUND_SPEED * RIDGE_VMAX_CM_S
+                                     * (CHUNK_SIZE / SAMPLE_RATE) / (SAMPLE_RATE / CHUNK_SIZE))).astype(int)  # bin별 최대 상승 bin
+# 경로 한 단계 계산용 이동표: 현재 bin i ← 이전 bin i-d (d = 0..최대 상승, 그리고 -1 = 1bin 하강)
+_RIDGE_D     = np.array(list(range(0, int(_RIDGE_STEP.max()) + 1)) + [-1])
+_RIDGE_SRC   = np.arange(len(_RIDGE_F))[:, None] - _RIDGE_D[None, :]          # (bin, 이동) 이전 bin 인덱스
+_RIDGE_OK    = ((_RIDGE_SRC >= 0) & (_RIDGE_SRC < len(_RIDGE_F))
+                & ((_RIDGE_D[None, :] <= _RIDGE_STEP[:, None]) | (_RIDGE_D[None, :] < 0)))   # 물리적으로 가능한 이동만
+_RIDGE_SRC   = np.clip(_RIDGE_SRC, 0, len(_RIDGE_F) - 1)
+_RIDGE_PEN   = np.where(_RIDGE_D < 0, RIDGE_DOWN_PEN, 0.0)[None, :]            # 하강 벌점
+_ridge_t     = deque(maxlen=_RIDGE_NMAX)   # 청크 시각(filling_elapsed)
+_ridge_p     = deque(maxlen=_RIDGE_NMAX)   # 청크별 돌출도(dB) 배열
+_ridge_path  = (np.empty(0), np.empty(0))  # 최근 계산한 경로 (시각 배열, 주파수 배열)
+_hyb_switched = False                       # [v5.51] 추정 수위 HYB_SWITCH_PCT 이후 원본 검출로 전환됨
+
+
+def _ridge_reset() -> None:
+    global _ridge_path
+    _ridge_t.clear()
+    _ridge_p.clear()
+    _ridge_path = (np.empty(0), np.empty(0))
+
+
+def _ridge_viterbi(P: np.ndarray) -> np.ndarray:
+    """
+    P: (주파수 bin, 시간) 돌출도. 청크마다 0~_RIDGE_STEP[bin] bin 상승(또는 벌점 붙은 1bin 하강)만 허용하는
+    경로 중 돌출도 합이 가장 큰 경로의 bin 인덱스(시간 순)를 반환.
+    """
+    n, nt = P.shape
+    rows  = np.arange(n)
+    score = P[:, 0].copy()
+    back  = np.zeros((n, nt), dtype=int)
+    for j in range(1, nt):
+        cand = np.where(_RIDGE_OK, score[_RIDGE_SRC] - _RIDGE_PEN, -1e9)   # (bin, 이동) 후보 점수
+        k    = np.argmax(cand, axis=1)                                     # 가장 좋은 이전 bin
+        score      = cand[rows, k] + P[:, j]
+        back[:, j] = _RIDGE_SRC[rows, k]
+    path = np.empty(nt, dtype=int)
+    path[-1] = int(np.argmax(score))
+    for j in range(nt - 1, 0, -1):
+        path[j - 1] = back[path[j], j]
+    return path
+
+
+def _ridge_push(chunk, t: float) -> None:
+    """청크 1개의 돌출도를 쌓고, 급수 RIDGE_START_SEC 이후면 최근 구간 경로를 다시 계산한다."""
+    global _ridge_path
+    mag = np.abs(np.fft.rfft(chunk * _RIDGE_WIN))[_RIDGE_BAND]
+    L   = 20.0 * np.log10(mag + 1e-9)
+    P   = (L - signal.medfilt(L, 2 * RIDGE_NEIGH_BINS + 1))[_RIDGE_SEL]   # 같은 순간 주변 주파수 대비 돌출도
+    P[_RIDGE_TONE_MASK] = RIDGE_CLIP_DB                                 # [v5.51] 장비 고정음 자리 제외
+    P   = np.maximum(P, RIDGE_CLIP_DB)
+    P   = signal.medfilt(P, 3)                                      # 주파수 방향 3bin 중앙값(한 bin짜리 잡음 제거)
+    _ridge_t.append(float(t))
+    _ridge_p.append(P)
+    if t < RIDGE_START_SEC or len(_ridge_p) < 3:
+        return
+    T  = np.array(_ridge_t)
+    k  = T >= RIDGE_START_SEC
+    if k.sum() < 3:
+        return
+    Pm = np.array(_ridge_p).T[:, k]                                # (bin, 시간)
+    _ridge_path = (T[k], _RIDGE_F[_ridge_viterbi(Pm)])
+
+
+def _ridge_now() -> float:
+    """현재 공명선 주파수(Hz). 경로가 없으면 0."""
+    T, F = _ridge_path
+    return float(F[-1]) if len(F) else 0.0
+
+
+def _ridge_init_freq(t_now: float):
+    """
+    초기 주파수 후보: 공명선(INIT_FIT_FROM~현재)의 ℓ=c/(4f) 강건 직선의 INIT_REF_TIME 시점 값.
+    그 직선이 물리 범위의 속도로 줄고(주파수가 오르고) 있으면 (f, True, 기울기),
+    아니면 (f, False, 기울기). 경로가 기준 시각을 덮지 못하면 (0, False, 0).
+    """
+    T, F = _ridge_path
+    if len(T) < 5 or T[-1] < INIT_REF_TIME:
+        return 0.0, False, 0.0
+    q = T >= INIT_FIT_FROM
+    if q.sum() < 10:
+        return 0.0, False, 0.0
+    # 경로(INIT_FIT_FROM~현재)를 ℓ 직선으로 강건 맞춤(Theil–Sen) → 기준 시각 값. 짧은 튐에 끌려가지 않음
+    Tq, Lq = T[q], SOUND_SPEED / (4.0 * F[q])
+    i, j  = np.triu_indices(len(Tq), 1)
+    ok    = (Tq[j] - Tq[i]) > 0.3
+    slope = float(np.median((Lq[j][ok] - Lq[i][ok]) / (Tq[j][ok] - Tq[i][ok])))   # dℓ/dt (cm/s, 차오르면 음수)
+    icpt  = float(np.median(Lq - slope * Tq))
+    f_ref = float(SOUND_SPEED / (4.0 * (icpt + slope * INIT_REF_TIME)))
+    rising = INIT_RISE_MIN_CM_S <= -slope <= INIT_RISE_MAX_CM_S
+    return f_ref, rising, slope
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -835,6 +980,7 @@ def start_filling_local() -> None:
     global _stag_buffer, _stag_last_log
     global bridge_active, bridge_start_elapsed, bridge_start_fill_pct, bridge_pred_fill_pct
     global bridge_start_q, bridge_start_freq, bridge_eta_sec, bridge_last_log
+    global _hyb_switched
 
     with lock:
         is_filling              = True
@@ -904,6 +1050,10 @@ def start_filling_local() -> None:
         bridge_start_freq       = 0.0
         bridge_eta_sec          = 0.0
         bridge_last_log         = 0.0
+        _ridge_reset()                       # [v5.50-RIDGE-TRACK]
+        _hyb_switched           = False      # [v5.51] 원본 검출로 전환됐는지
+        if DEVICE_TONE_ENABLE:
+            noise_profile.extend(DEVICE_TONES_HZ)   # [v5.51] 원본 검출(LPC/FFT)에서도 고정음 근처 피크 제외
     print('\n>>> [1단계] 배경 소음 측정 (3초)...')
 
 
@@ -949,6 +1099,7 @@ def audio_callback(indata, frames, time_info, status):
     global _stag_buffer, _stag_last_log
     global bridge_active, bridge_start_elapsed, bridge_start_fill_pct, bridge_pred_fill_pct
     global bridge_start_q, bridge_start_freq, bridge_eta_sec, bridge_last_log
+    global _hyb_switched
 
     if not is_filling:
         return
@@ -983,6 +1134,10 @@ def audio_callback(indata, frames, time_info, status):
             return
 
         filling_elapsed = elapsed - NOISE_CALIBRATION_TIME
+
+        # ── [v5.50-RIDGE-TRACK] 공명선 누적·경로 계산 (가드 구간 포함 매 청크) ──
+        if RIDGE_ENABLE:
+            _ridge_push(chunk, filling_elapsed)
 
         # ── 2단계: SPLASH 구간 펌프 소음 보완 ──────────────────────
         if filling_elapsed < SPLASH_GUARD_TIME:
@@ -1048,17 +1203,27 @@ def audio_callback(indata, frames, time_info, status):
         with lock:
             _init_confirmed = (initial_stable_freq > 0)
 
-        if not _init_confirmed:
-            filtered   = signal.sosfilt(HP_SOS, chunk.astype(float))
-            detected_f = fft_backup_frequency(filtered, _last, current_floor, current_ceil)
-            detected_f = _harmonic_correct(detected_f, _last)
+        if RIDGE_ENABLE and not _hyb_switched:
+            with lock:
+                _fill_now = float(last_fill_pct) if calibration_done else 0.0
+            if _fill_now >= HYB_SWITCH_PCT:
+                _hyb_switched = True
+                print(f'\n[v5.51] 추정 수위 {_fill_now:.1f}% → 원본 검출(LPC/FFT)로 전환 (t={filling_elapsed:.1f}s)')
+        if RIDGE_ENABLE and not _hyb_switched:
+            # [v5.51] 50% 전: 공명선 끝값. 3단계 탐색 범위(하한 규칙)는 적용하지 않음(경로가 이미 연속성으로 거름)
+            detected_f = _ridge_now()
         else:
-            detected_f = get_frequency(chunk, _last, current_floor, current_ceil)
+            if not _init_confirmed:
+                filtered   = signal.sosfilt(HP_SOS, chunk.astype(float))
+                detected_f = fft_backup_frequency(filtered, _last, current_floor, current_ceil)
+                detected_f = _harmonic_correct(detected_f, _last)
+            else:
+                detected_f = get_frequency(chunk, _last, current_floor, current_ceil)
 
-        if detected_f < current_floor or detected_f == 0:
-            detected_f = 0.0
-        if filling_elapsed < 3.5 and detected_f > EARLY_CEIL_HZ:
-            detected_f = 0.0
+            if detected_f < current_floor or detected_f == 0:
+                detected_f = 0.0
+            if filling_elapsed < 3.5 and detected_f > EARLY_CEIL_HZ:
+                detected_f = 0.0
 
         if detected_f == 0.0:
             consecutive_loss_count += 1
@@ -1217,7 +1382,20 @@ def audio_callback(indata, frames, time_info, status):
             last_stable_f   = stable_f
             last_detected_f = raw_f_for_reg
             last_f_for_stop = f_for_stop_plot
-            if (filling_elapsed > SPLASH_GUARD_TIME
+            if (RIDGE_ENABLE
+                    and initial_stable_freq == 0
+                    and filling_elapsed >= INIT_REF_TIME + INIT_LAG_SEC):
+                # [v5.50-RIDGE-TRACK] 공명선 직선의 6.85s 값, 그 직선이 올라가고 있을 때만 확정
+                f_ref, rising, sl = _ridge_init_freq(filling_elapsed)
+                if f_ref > INIT_STABLE_MIN_HZ and (rising or filling_elapsed >= INIT_GIVEUP_SEC):
+                    initial_stable_freq = f_ref
+                    initial_stable_time = INIT_REF_TIME
+                    print(f'\n[★ 초기주파수 확정(공명선)] {initial_stable_freq:.0f}Hz @t={INIT_REF_TIME:.2f}s'
+                          f' | 공명선 기울기 {sl:.3f}cm/s'
+                          + ('' if rising else ' | ⚠ 상승 미확인(물소리 등 고정음일 수 있음) — 시간 초과로 확정')
+                          + f' | 현재 t={filling_elapsed:.1f}s')
+            if (not RIDGE_ENABLE
+                    and filling_elapsed > SPLASH_GUARD_TIME
                     and initial_stable_freq == 0
                     and stable_f > INIT_STABLE_MIN_HZ):
                 init_stable_buffer.append(stable_f)
