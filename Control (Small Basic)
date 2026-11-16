@@ -70,14 +70,14 @@ INA219_BUS = 3  # GPIO0(SDA/물리27), GPIO1(SCL/물리28)의 i2c-gpio 버스
 INA219_ADDRESS = 0x40
 VOLTAGE_INTERVAL = 0.2  # 배터리 측정 및 PWM 갱신 간격(s)
 VOLTAGE_MAX_AGE = 1.0  # 측정값 갱신 지연 허용 시간(s)
-PUMP_TARGET_V = 10.0  # 목표 환산 평균 전압; 펌프 단자 DC 실측값은 아님
+PUMP_TARGET_V = 8.5  # 목표 환산 평균 전압; 펌프 단자 DC 실측값은 아님
 PUMP_PWM_HZ = 1000.0  # lgpio 소프트웨어 타이밍 PWM
 VALVE_LEAD_S = 0.1  # 밸브를 먼저 열고 펌프를 켤 때까지 대기
 VALVE_TAIL_S = 0.1  # 정상 완료 시 펌프 OFF 후 밸브를 닫을 때까지 대기
-MAX_RUN_S = 300.0  # 테스트 코드의 최대 운전 시간; 0은 제한 해제
+MAX_RUN_S = 30.0  # 테스트 코드의 최대 운전 시간; 0은 제한 해제
 LOOP_SECONDS = 0.005  # STOP/상태 전이 확인 주기; OS에 따른 지연은 별도
 
-FLOW_PULSES_PER_LITRE = 2070.94  # YF-S402B 초기값; 실측 보정 필요
+FLOW_PULSES_PER_LITRE = 1941.5  # YF-S402B 초기값; 실측 보정 필요
 FLOW_MIN_EDGE_US = 200.0  # 버튼 디바운스를 유량 입력에 적용하지 않음
 
 
@@ -525,7 +525,7 @@ END_CORRECTION_K = 0.35
 TARGET_FILL_PCT         = 70.0
 STOP_ADVANCE_PCT        = 0.0
 STOP_OFFSET_HZ          = 0
-DIAMETER_SCALE          = 1.0
+DIAMETER_SCALE          = 0.90
 CALC_START_TIME         = 6.0
 DIAM_CALC_END_TIME      = 30.0
 CONTROL_START_TIME      = 7.0
@@ -595,13 +595,13 @@ SNR_THRESHOLD      = 2.0
 NOISE_FLOOR_PCTILE = 70
 
 # ── [v5.29-ASYM-EMA] f_for_stop 비대칭 EMA ──────────────────────────
-FSCORE_ALPHA_UP   = 0.80   # 상승 반영 속도 (새 값 80% 즉시 반영)
-FSCORE_ALPHA_DOWN = 0.05   # 하강 반영 속도 (거의 안 내려감)
+FSCORE_ALPHA_UP   = 0.70   # 상승 반영 속도 (새 값 80% 즉시 반영)
+FSCORE_ALPHA_DOWN = 0.10   # 하강 반영 속도 (거의 안 내려감)
 
 # ── 주파수 탐색 범위 ─────────────────────────────────────────────────
 FREQ_MAX_LIMIT           = 3000
 EARLY_CEIL_HZ            = 1000
-FREQ_MIN_LIMIT           = 300
+FREQ_MIN_LIMIT           = 650
 CALIBRATION_CUTOFF_RATIO = 0.9
 
 # ── 녹음/타이밍 ──────────────────────────────────────────────────────
@@ -687,7 +687,7 @@ FREEZE_RESET_N = 8
 BUF_SIZE_FINAL = 3
 
 # ── init_stable 최소 주파수 ──────────────────────────────────────────
-INIT_STABLE_MIN_HZ = 350
+INIT_STABLE_MIN_HZ = 650
 
 # ── 기타 ────────────────────────────────────────────────────────────
 MIN_SLOPE_CUTOFF = 16 * FLOW_RATE / (np.pi * SOUND_SPEED * 15.0**2) * 0.3
@@ -2313,3 +2313,4 @@ def close_window(app, before_destroy=None):
         finally:
             cancel_pending_callbacks(app)
             app.quit()
+
