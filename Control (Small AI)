@@ -80,12 +80,465 @@ import scipy.signal as signal
 import time
 import threading
 from collections import deque
-from gpiozero import OutputDevice, Button
+import sys
+import atexit
+import queue
+import math
+import traceback
+
+# ──────────────────────────────────────────────────────────────────
+# 1. 새 PCB 설정 — GPIO/INA219/PWM/유량센서
+# ──────────────────────────────────────────────────────────────────
+GPIO_CHIP = 0  # 앞서 정상 작동한 RP1 gpiochip 번호
+PINS = {"pump": 8, "valve": 18, "led12": 23, "board": 7,
+        "start": 3, "stop": 5, "flow": 27}
+
+INA219_BUS = 3  # GPIO0(SDA/물리27), GPIO1(SCL/물리28)의 i2c-gpio 버스
+INA219_ADDRESS = 0x40
+VOLTAGE_INTERVAL = 0.2  # 배터리 측정 및 PWM 갱신 간격(s)
+VOLTAGE_MAX_AGE = 1.0  # 측정값 갱신 지연 허용 시간(s)
+PUMP_TARGET_V = 10.0  # 목표 환산 평균 전압; 펌프 단자 DC 실측값은 아님
+PUMP_PWM_HZ = 1000.0  # lgpio 소프트웨어 타이밍 PWM
+VALVE_LEAD_S = 0.1  # 밸브를 먼저 열고 펌프를 켤 때까지 대기
+VALVE_TAIL_S = 0.1  # 정상 완료 시 펌프 OFF 후 밸브를 닫을 때까지 대기
+MAX_RUN_S = 300.0  # 테스트 코드의 최대 운전 시간; 0은 제한 해제
+LOOP_SECONDS = 0.005  # STOP/상태 전이 확인 주기; OS에 따른 지연은 별도
+
+FLOW_PULSES_PER_LITRE = 1941.5  # YF-S402B 초기값; 실측 보정 필요
+FLOW_MIN_EDGE_US = 200.0  # 버튼 디바운스를 유량 입력에 적용하지 않음
+
+
+# ──────────────────────────────────────────────────────────────────
+# 2. GPIO 및 펌프 드라이버 — STOP/전압 보호 포함
+# ──────────────────────────────────────────────────────────────────
+
+
+
+class INA219Monitor:
+    """별도 스레드에서 I2C 처리: GPIO STOP 처리 중 I2C 응답을 기다리지 않는다."""
+    def __init__(self, clock=time.monotonic, bus_factory=None):
+        self.clock, self.bus_factory = clock, bus_factory
+        self.lock = threading.Lock()
+        self.value = self.updated = None
+        self.error = "INA219 첫 측정 대기 중"
+        self.stop_event = threading.Event()
+        self.worker = None
+
+    @staticmethod
+    def decode(data):
+        if len(data) != 2 or any(not isinstance(x, int) or not 0 <= x <= 255 for x in data):
+            raise ValueError("INA219 전압 데이터 형식 오류")
+        voltage = (((data[0] << 8) | data[1]) >> 3) * 0.004
+        if not 0 < voltage <= 26:
+            raise ValueError(f"INA219 전압 {voltage:.3f}V: VIN−/GND 및 전원을 확인하세요.")
+        return voltage
+
+    def snapshot(self):
+        with self.lock:
+            return dict(value=self.value, updated=self.updated, error=self.error)
+
+    def start(self):
+        self.worker = threading.Thread(target=self._work, name="ina219-monitor", daemon=True)
+        self.worker.start()
+
+    def _work(self):
+        bus = None
+        try:
+            if self.bus_factory is None:
+                from smbus2 import SMBus
+                factory = SMBus
+            else:
+                factory = self.bus_factory
+            bus = factory(INA219_BUS)
+            # 32V 레인지, 12bit, 버스 전압 연속 측정. MSB 먼저 전송한다.
+            bus.write_i2c_block_data(INA219_ADDRESS, 0x00, [0x21, 0x9E])
+            if self.stop_event.wait(0.01):
+                return
+            while not self.stop_event.is_set():
+                try:
+                    value = self.decode(bus.read_i2c_block_data(INA219_ADDRESS, 0x02, 2))
+                    with self.lock:
+                        self.value, self.updated, self.error = value, self.clock(), ""
+                except Exception as exc:
+                    with self.lock:
+                        self.error = f"INA219 읽기 실패: {exc}"
+                if self.stop_event.wait(VOLTAGE_INTERVAL):
+                    break
+        except Exception as exc:
+            with self.lock:
+                self.error = f"INA219 초기화 실패: {exc}"
+        finally:
+            if bus is not None:
+                try:
+                    bus.close()
+                except Exception:
+                    traceback.print_exc()
+
+    def close(self):
+        self.stop_event.set()
+        if self.worker is not None:
+            self.worker.join(timeout=1)
+
+
+class FlowCounter:
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.created = clock()
+        self.raw = self.accepted = self.rejected = self.zero = 0
+        self.last_tick = self.last_time = None
+        self.times = deque()
+        self.min_ns = 200000
+
+    def set_filter(self, microseconds):
+        with self.lock:
+            self.min_ns = round(microseconds * 1000)
+
+    def rising(self, tick_ns, arrival=None):
+        now = self.clock() if arrival is None else arrival
+        with self.lock:
+            self.raw += 1
+            if self.last_tick is not None and tick_ns - self.last_tick < self.min_ns:
+                self.rejected += 1
+                return
+            self.accepted += 1
+            self.last_tick, self.last_time = tick_ns, now
+            self.times.append(now)
+            while self.times and self.times[0] < now - 2:
+                self.times.popleft()
+
+    def snapshot(self, now=None):
+        now = self.clock() if now is None else now
+        with self.lock:
+            while self.times and self.times[0] <= now - 1:
+                self.times.popleft()
+            window = min(1.0, max(now - self.created, 0.001))
+            return dict(total=self.accepted, display=self.accepted-self.zero,
+                        raw=self.raw, rejected=self.rejected, hz=len(self.times)/window,
+                        last=self.last_time)
+
+    def reset_display(self):
+        with self.lock:
+            self.zero = self.accepted
+
+
+class StopHeld(RuntimeError):
+    pass
+
+
+class RPiHardware:
+    simulated = False
+
+    def __init__(self, flow):
+        import lgpio
+        self.lg = lgpio
+        self.handle = None
+        self.callback = None
+        self.claimed = []
+        self.outputs = dict(pump=0.0, valve=False, led12=False, board=False)
+        self.pwm_frequency = 1000.0
+        self._pwm_active = False
+        try:
+            self.handle = lgpio.gpiochip_open(GPIO_CHIP)
+            info = lgpio.gpio_get_chip_info(self.handle)
+            if "rp1" not in " ".join(map(str, info)).lower():
+                raise RuntimeError(f"gpiochip{GPIO_CHIP}가 RP1 헤더 장치인지 확인하세요: {info}")
+            for name in ("start", "stop"):
+                lgpio.gpio_claim_input(self.handle, PINS[name], lgpio.SET_PULL_UP)
+                self.claimed.append(name)
+            for name in ("pump", "valve", "led12", "board"):
+                lgpio.gpio_claim_output(self.handle, PINS[name], 0)
+                self.claimed.append(name)
+            lgpio.gpio_claim_alert(self.handle, PINS["flow"], lgpio.RISING_EDGE,
+                                   lgpio.SET_PULL_NONE)
+            self.claimed.append("flow")
+            self.callback = lgpio.callback(
+                self.handle, PINS["flow"], lgpio.RISING_EDGE,
+                lambda chip, gpio, level, tick: flow.rising(tick) if level == 1 else None)
+        except BaseException:
+            self.close()
+            raise
+
+    def buttons(self):
+        return (not bool(self.lg.gpio_read(self.handle, PINS["start"])),
+                not bool(self.lg.gpio_read(self.handle, PINS["stop"])))
+
+    def set(self, name, value, frequency=1000.0):
+        if value and self.buttons()[1]:
+            raise StopHeld("STOP 버튼이 눌려 있습니다.")
+        if name == "pump":
+            value = float(value)
+            if value:
+                result = self.lg.tx_pwm(self.handle, PINS[name], frequency, value)
+                if result < 0:
+                    raise RuntimeError(f"PWM 오류: {result}")
+                self.pwm_frequency = frequency
+                self._pwm_active = True
+            else:
+                # PWM을 한 번도 시작하지 않은 LED 시험에서도 all_off가 호출된다.
+                # 이때 불필요한 tx_pwm(0,0)을 보내지 않는다. 실행 중인 PWM은
+                # 유효한 기존 주파수에서 duty=0으로 바꾸고 LOW를 명령한다.
+                # PWM API가 실패해도 LOW 명령은 시도하며 오류를 숨기지 않는다.
+                try:
+                    if self._pwm_active:
+                        result = self.lg.tx_pwm(self.handle, PINS[name], self.pwm_frequency, 0)
+                        if result < 0:
+                            raise RuntimeError(f"PWM 정지 오류: {result}")
+                        self._pwm_active = False
+                finally:
+                    self.lg.gpio_write(self.handle, PINS[name], 0)
+        else:
+            self.lg.gpio_write(self.handle, PINS[name], int(bool(value)))
+        self.outputs[name] = value
+
+    def all_off(self):
+        errors = []
+        for name in ("pump", "valve", "led12", "board"):
+            if name in self.claimed:
+                try:
+                    self.set(name, 0)
+                except Exception as exc:
+                    errors.append(f"{name}: {exc}")
+        if errors:
+            raise RuntimeError(" / ".join(errors))
+
+    def close(self):
+        if self.handle is None:
+            return
+        try:
+            self.all_off()
+        except Exception:
+            traceback.print_exc()
+        if self.callback is not None:
+            try:
+                self.callback.cancel()
+            except Exception:
+                traceback.print_exc()
+        try:
+            self.lg.gpiochip_close(self.handle)
+        finally:
+            self.handle = None
+
+    def advance(self, dt, now):
+        pass
+
+
+class WaterHardware:
+    """GPIO를 단독 소유한다. I2C는 별도 스레드이며 STOP이 I2C를 기다리지 않는다."""
+    def __init__(self, io=None, voltage=None, clock=time.monotonic, wall_clock=time.time):
+        self.clock, self.wall_clock = clock, wall_clock
+        self.lock = threading.RLock()
+        self.events = queue.Queue()
+        self.flow = FlowCounter(clock)
+        self.flow.set_filter(FLOW_MIN_EDGE_US)
+        self.io = io if io is not None else RPiHardware(self.flow)
+        self.voltage = voltage if voltage is not None else INA219Monitor(clock)
+        self.phase = 'IDLE'
+        self.run_id = 0
+        self.stop_generation = 0  # STOP 이전에 대기열에 들어간 시작 명령을 무효화
+        self.reason = self.error = ''
+        self.deadline = self.started = self.last_pwm = 0.0
+        self.pump_started_wall = 0.0
+        self.last_run_duty = 0.0
+        self.last_run_voltage = None
+        self.baseline = 0
+        self._stop = threading.Event()
+        self._worker = None
+        self._start_raw = self._start_stable = True  # 시작 시 눌린 버튼으로 자동 가동하지 않음
+        self._start_since = clock()
+        self._stop_raw = False
+        self._closed = False
+
+    def start_monitoring(self):
+        with self.lock:
+            if self._worker is not None:
+                return
+            self.voltage.start()
+            self._worker = threading.Thread(target=self._work, name='pcb-control', daemon=True)
+            self._worker.start()
+
+    def _voltage(self):
+        s = self.voltage.snapshot()
+        value, updated = s['value'], s['updated']
+        age = None if updated is None else self.clock() - updated
+        error = s['error']
+        if not error and (age is None or age < 0 or age > VOLTAGE_MAX_AGE):
+            error = 'INA219 측정값 갱신 지연 (1초 초과)'
+        if not error and (value is None or not math.isfinite(value) or not 0 < value <= 26):
+            error = 'INA219 전압값 오류'
+        return dict(value=value, age=age, error=error)
+
+    def _duty(self):
+        s = self._voltage()
+        if s['error']:
+            raise RuntimeError(s['error'])
+        if not math.isfinite(PUMP_TARGET_V) or not 0 < PUMP_TARGET_V <= 10.0:
+            raise ValueError('펌프 목표 환산 전압은 0V 초과 10V 이하입니다.')
+        if s['value'] < PUMP_TARGET_V:
+            raise RuntimeError(f"배터리 {s['value']:.3f}V < 목표 {PUMP_TARGET_V:g}V")
+        return 100.0 * PUMP_TARGET_V / s['value']
+
+    def begin_run(self, calibration_s, expected_generation=None):
+        if not math.isfinite(calibration_s) or not 0 <= calibration_s <= 60:
+            raise ValueError('소음 측정 시간은 0~60초입니다.')
+        if not (math.isfinite(PUMP_PWM_HZ) and 10 <= PUMP_PWM_HZ <= 10000):
+            raise ValueError('PWM 주파수는 10~10000Hz입니다.')
+        if not all(math.isfinite(x) and x >= 0 for x in
+                   (VALVE_LEAD_S, VALVE_TAIL_S, MAX_RUN_S)):
+            raise ValueError('밸브 대기/최대 운전 시간 설정을 확인하세요.')
+        if not math.isfinite(FLOW_PULSES_PER_LITRE) or FLOW_PULSES_PER_LITRE <= 0:
+            raise ValueError('유량센서 펄스/L은 양수여야 합니다.')
+        with self.lock:
+            if expected_generation is not None and expected_generation != self.stop_generation:
+                raise StopHeld('시작 요청 이후 STOP이 입력되어 시작을 취소했습니다.')
+            if self._closed or self.phase != 'IDLE':
+                raise RuntimeError(f'하드웨어가 대기 상태가 아닙니다: {self.phase} {self.error}')
+            if self.io.buttons()[1]:
+                raise StopHeld('STOP 버튼이 눌려 있습니다.')
+            self._duty()  # 첫 정상 전압 확인 전에는 밸브도 열지 않음
+            self.io.all_off()
+            self.run_id += 1
+            self.reason = self.error = ''
+            self.started = self.clock()
+            self.deadline = self.started + calibration_s + 0.1
+            self.baseline = self.flow.snapshot()['total']
+            self.pump_started_wall = 0.0
+            self.last_run_duty = 0.0
+            self.last_run_voltage = None
+            self.phase = 'CALIBRATION'
+            return self.run_id
+
+    def stop(self, reason='manual_stop', normal=False, fault=False):
+        """모든 종료 경로에서 펌프를 먼저 끈다. 긴급/오류는 밸브도 즉시 OFF."""
+        with self.lock:
+            if self._closed:
+                return
+            active = self.phase in ('CALIBRATION', 'LEAD', 'ON')
+            self.stop_generation += 1
+            old_fault = self.phase == 'FAULT'
+            errors = []
+            for name in ('pump', 'led12', 'board'):
+                try:
+                    self.io.set(name, 0)
+                except Exception as exc:
+                    errors.append(f'{name}: {exc}')
+            tail = normal and active and bool(self.io.outputs['valve']) and not errors
+            if tail:
+                self.phase, self.deadline = 'TAIL', self.clock() + VALVE_TAIL_S
+            else:
+                try:
+                    self.io.set('valve', 0)
+                except Exception as exc:
+                    errors.append(f'valve: {exc}')
+                self.phase = 'FAULT' if fault or errors or old_fault else 'IDLE'
+            if active or fault or errors:
+                self.reason = str(reason)
+            if fault or errors:
+                self.error = str(reason) + (' / ' + ' / '.join(errors) if errors else '')
+                self.phase = 'FAULT'
+            if active or fault or errors:
+                self.events.put(('stopped', self.run_id, self.snapshot()))
+
+    def snapshot(self):
+        with self.lock:
+            s = self._voltage()
+            f = self.flow.snapshot()
+            pulses = max(0, f['total'] - self.baseline)
+            return dict(phase=self.phase, run_id=self.run_id, stop_generation=self.stop_generation,
+                        reason=self.reason, error=self.error, battery_v=s['value'],
+                        battery_age_s=s['age'], voltage_error=s['error'],
+                        pump_duty_pct=float(self.io.outputs['pump']), pump_target_v=PUMP_TARGET_V,
+                        pump_last_duty_pct=self.last_run_duty,
+                        pump_est_avg_v=(self.last_run_voltage*self.last_run_duty/100
+                                        if self.last_run_voltage is not None else 0.0),
+                        pwm_hz=PUMP_PWM_HZ, valve_on=bool(self.io.outputs['valve']),
+                        pump_started_wall=self.pump_started_wall,
+                        flow_hz=f['hz'], flow_l_min=f['hz']*60/FLOW_PULSES_PER_LITRE,
+                        run_pulses=pulses, run_volume_ml=pulses*1000/FLOW_PULSES_PER_LITRE,
+                        raw_pulses=f['raw'], rejected_edges=f['rejected'])
+
+    def _tick(self):
+        with self.lock:
+            now = self.clock()
+            start, stop = self.io.buttons()
+            if stop:
+                if not self._stop_raw or self.phase in ('CALIBRATION', 'LEAD', 'ON', 'TAIL'):
+                    self.stop('physical_STOP')
+                self._start_raw = self._start_stable = True  # 동시 누름 후 START를 놓아야 재시작
+                self._start_since = now
+            self._stop_raw = stop
+            if start != self._start_raw:
+                self._start_raw, self._start_since = start, now
+            if now - self._start_since >= 0.03 and start != self._start_stable:
+                self._start_stable = start
+                if start and not stop and self.phase == 'IDLE':
+                    self.events.put(('start_button', self.run_id, self.stop_generation))
+            if self.phase in ('IDLE', 'FAULT', 'CLOSED'):
+                return
+            if self.phase == 'TAIL':
+                if now >= self.deadline:
+                    self.io.set('valve', 0)
+                    self.phase = 'IDLE'
+                return
+            duty = self._duty()  # 센서 오류/오래된 값/저전압일 때 이전 듀티를 유지하지 않음
+            if MAX_RUN_S and now - self.started >= MAX_RUN_S:
+                self.stop('max_run_time', fault=True)
+                return
+            if self.phase == 'CALIBRATION' and now >= self.deadline:
+                self.io.set('valve', True)
+                self.phase, self.deadline = 'LEAD', now + VALVE_LEAD_S
+            elif self.phase == 'LEAD' and now >= self.deadline:
+                self.io.set('pump', duty, PUMP_PWM_HZ)
+                self.last_run_duty, self.last_run_voltage = duty, PUMP_TARGET_V*100/duty
+                self.io.set('led12', True)
+                self.io.set('board', True)
+                self.pump_started_wall = self.wall_clock()
+                self.last_pwm, self.phase = now, 'ON'
+                self.events.put(('pump_on', self.run_id, self.pump_started_wall))
+            elif self.phase == 'ON' and now - self.last_pwm >= VOLTAGE_INTERVAL:
+                if abs(duty - self.io.outputs['pump']) >= 0.01:
+                    self.io.set('pump', duty, PUMP_PWM_HZ)
+                    self.last_run_duty, self.last_run_voltage = duty, PUMP_TARGET_V*100/duty
+                self.last_pwm = now
+
+    def tick(self):
+        try:
+            self._tick()
+        except StopHeld:
+            self.stop('physical_STOP')
+        except Exception as exc:
+            self.stop(str(exc), fault=True)
+            # FAULT 상태에서는 재가동하지 않는다. 프로그램 재실행 후 확인한다.
+
+    def _work(self):
+        while not self._stop.wait(LOOP_SECONDS):
+            self.tick()
+
+    def close(self):
+        with self.lock:
+            if self._closed:
+                return
+            self.stop('app_close')
+            self._closed = True
+            self.phase = 'CLOSED'
+            self._stop.set()
+        if self._worker is not None and threading.current_thread() is not self._worker:
+            self._worker.join(timeout=1.0)
+        try:
+            self.io.close()
+        finally:
+            self.voltage.close()
+
+
+# ──────────────────────────────────────────────────────────────────
+
 
 # ── 파일/GPIO 설정 ──────────────────────────────────────────────────
 CSV_FILENAME      = 'experiment_results.csv'
-INPUT_DEVICE      = 1
-SOLENOID_GPIO     = 7
+INPUT_DEVICE      = 'USB Lavalier Microphone'  # 새 정수기 분석용 USB 마이크
+SOLENOID_GPIO     = PINS['valve']
+PUMP_GPIO         = PINS['pump']
+FLOW_GPIO         = PINS['flow']
 SW_ON_GPIO        = 3
 SW_OFF_GPIO       = 5
 RELAY_ACTIVE_HIGH = True
@@ -266,7 +719,7 @@ INIT_STABLE_MIN_HZ = 350
 
 # ── [v5.50-RIDGE-TRACK] 공명선 추적 ──────────────────────────────────
 RIDGE_ENABLE       = True    # False: 기존(v5.32) LPC/FFT 검출 + 기존 초기 주파수 방식 + 6초 가드
-HYB_SWITCH_PCT     = 50.0    # 추정 수위가 이 값을 한 번 넘으면 원본 검출(LPC/FFT)로 전환(이후 유지)
+HYB_SWITCH_PCT     = 70.0    # 추정 수위가 이 값을 한 번 넘으면 원본 검출(LPC/FFT)로 전환(이후 유지)
 DEVICE_TONE_ENABLE = True    # 장비 고정음 제외 사용
 DEVICE_TONES_HZ    = [431.0, 506.0, 829.0, 1163.0, 1475.0, 2024.0, 2487.0]   # 녹음 17회에서 컵과 무관하게 반복된 고정음
 DEVICE_TONE_TOL_HZ = 15.0    # 공명선 점수에서 빼는 폭(±Hz). 원본 검출은 noise_profile 기준(±25Hz) 그대로
@@ -410,25 +863,151 @@ CB_EXPECTED_MS     = CHUNK_SIZE / SAMPLE_RATE * 1000.0  # 기대 호출 주기(m
 
 _reg_event = threading.Event()
 
-# ── GPIO 초기화 ──────────────────────────────────────────────────────
-solenoid = OutputDevice(SOLENOID_GPIO, active_high=RELAY_ACTIVE_HIGH, initial_value=False)
-sw_on    = Button(SW_ON_GPIO,  pull_up=True, bounce_time=0.05)
-sw_off   = Button(SW_OFF_GPIO, pull_up=True, bounce_time=0.05)
+# ── 새 PCB 제어: GPIO는 이 파일의 WaterHardware만 소유한다 ─────────────────────────
+_hardware = None
+_control_lock = threading.RLock()
+_hardware_event_stop = threading.Event()
+_hardware_event_thread = None
+_current_run_id = 0
+ui_requests = queue.Queue()  # 작업 스레드는 Tk 위젯에 직접 접근하지 않는다.
+hardware_error = ''
+last_stop_reason = ''
+last_hardware_snapshot = {}
+water_started_time = 0.0
+VOICE_ENABLED = True
+_shutting_down = False
 
 
-# ════════════════════════════════════════════════════════════════════
-#  GPIO 제어
-# ════════════════════════════════════════════════════════════════════
-def solenoid_on():
-    try: solenoid.on()
-    except Exception as e: print(f'\n[GPIO ON 실패] {e}')
+def initialize_hardware():
+    global _hardware, _hardware_event_thread
+    with _control_lock:
+        if _hardware is None:
+            _hardware = WaterHardware()
+            _hardware.start_monitoring()
+            _hardware_event_stop.clear()
+            _hardware_event_thread = threading.Thread(
+                target=_hardware_events, name='core-hardware-events', daemon=True)
+            _hardware_event_thread.start()
+    return _hardware
+
+
+def hardware_status():
+    return _hardware.snapshot() if _hardware is not None else {}
+
+
+def enqueue_start():
+    """음성/버튼 시작 요청. STOP이 먼저 처리되면 오래된 요청은 무효화한다."""
+    hw = initialize_hardware()
+    ui_requests.put(('start', hw.snapshot()['stop_generation']))
+
+
+def _hardware_events():
+    global water_started_time, filling_start_time
+    while not _hardware_event_stop.is_set():
+        try:
+            kind, run_id, value = _hardware.events.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        try:
+            _handle_hardware_event(kind, run_id, value)
+        except Exception as exc:
+            print(f'\n[PCB 상태 처리 오류] {exc}')
+            _hardware.stop(str(exc), fault=True)
+
+
+def _handle_hardware_event(kind, run_id, value):
+    global water_started_time, filling_start_time
+    with _control_lock:
+        if kind == 'start_button':
+            ui_requests.put(('start', value))
+        elif run_id == _current_run_id:
+            if kind == 'pump_on':
+                with lock:
+                    if is_filling:
+                        water_started_time = value
+                        # 원래의 elapsed-NOISE_CALIBRATION_TIME 식을 실제 펌프 ON에 맞춘다.
+                        filling_start_time = value - NOISE_CALIBRATION_TIME
+                print('\n>>> [2단계] 밸브 선행 완료. 펌프 PWM 가동!')
+            elif kind == 'stopped':
+                _finish_filling(True, value['reason'], value)
+
+
+def _finish_filling(save_result, reason, snapshot):
+    global is_filling, request_finish, history_freq_snapshot, last_stop_elapsed_sec
+    global last_stop_reason, hardware_error, last_hardware_snapshot
+    with lock:
+        if not is_filling:
+            return  # STOP 반복/늦게 도착한 이벤트로 완료 상태를 덮어쓰지 않음
+        history_freq_snapshot = list(history_freq)
+        last_stop_elapsed_sec = (max(0.0, time.time() - water_started_time)
+                                 if water_started_time else 0.0)
+        last_stop_reason = reason
+        hardware_error = snapshot.get('error', '')
+        last_hardware_snapshot = dict(snapshot)
+        is_filling = False
+        request_finish = bool(save_result)
+    close_audio_stream_async(delay_sec=0.35)
+    print(f'\n>>> 물 주입 종료: {reason}' + (f' / {hardware_error}' if hardware_error else ''))
+
+
+def start_filling_local(expected_generation=None) -> bool:
+    global _current_run_id, hardware_error, last_stop_reason, water_started_time
+    global last_hardware_snapshot
+    hw = initialize_hardware()
+    if expected_generation is None:
+        expected_generation = hw.snapshot()['stop_generation']
+    # close 작업을 기다리는 동안 제어 락을 점유하지 않아 STOP 처리가 가능하다.
+    with _audio_lifecycle_lock, _control_lock:
+        with lock:
+            if is_filling or _shutting_down:
+                return False
+        ensure_audio_stream()
+        try:
+            _current_run_id = hw.begin_run(NOISE_CALIBRATION_TIME, expected_generation)
+            _reset_filling_state()
+            with lock:
+                hardware_error = last_stop_reason = ''
+                water_started_time = 0.0
+                last_hardware_snapshot = {}
+            return True
+        except Exception:
+            hw.stop('start_failed')
+            close_audio_stream_async()
+            raise
+
+
+def stop_filling_local(save_result=True, reason='manual_stop', immediate=True) -> None:
+    with _control_lock:
+        if _hardware is not None:
+            _hardware.stop(reason, normal=not immediate,
+                           fault=reason in ('audio_error', 'gui_error'))
+            snapshot = _hardware.snapshot()
+        else:
+            snapshot = {}
+        _finish_filling(save_result, reason, snapshot)
+
+
+def shutdown_hardware():
+    """GUI 종료/예외/인터럽트 시 출력과 GPIO 소유권을 정리한다."""
+    global _shutting_down
+    _shutting_down = True
+    _hardware_event_stop.set()
+    stop_filling_local(save_result=False, reason='app_close')
+    if _hardware is not None:
+        _hardware.close()
+    _close_audio_if_idle(audio_stream)
+
 
 def solenoid_off():
-    try: solenoid.off()
-    except Exception as e: print(f'\n[GPIO OFF 실패] {e}')
+    """기존 OFF 호출도 새 펌프와 밸브를 함께 정지한다."""
+    stop_filling_local(save_result=True)
+
 
 def solenoid_off_async():
     threading.Thread(target=solenoid_off, daemon=True).start()
+
+
+atexit.register(shutdown_hardware)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1015,7 +1594,7 @@ _reg_worker_thread.start()
 # ════════════════════════════════════════════════════════════════════
 #  급수 시작/종료
 # ════════════════════════════════════════════════════════════════════
-def start_filling_local() -> None:
+def _reset_filling_state() -> None:
     global is_filling, filling_start_time, calibration_done
     global freq_buffer, reg_time_buffer, reg_inv_freq_buffer
     global diameter_candidates, history_time, history_freq
@@ -1122,17 +1701,7 @@ def start_filling_local() -> None:
     print('\n>>> [1단계] 배경 소음 측정 (3초)...')
 
 
-def stop_filling_local(save_result: bool) -> None:
-    global is_filling, request_finish, history_freq_snapshot
-    global last_stop_elapsed_sec
-    with lock:
-        history_freq_snapshot = list(history_freq)
-        last_stop_elapsed_sec = max(0.0, time.time() - filling_start_time - NOISE_CALIBRATION_TIME)
-        is_filling = False
-        if save_result:
-            request_finish = True
-    close_audio_stream_async(delay_sec=0.35)                    # 급수 종료 후 분석용 오디오 스트림을 확실히 해제
-    print('\n>>> 물 주입 종료.')
+
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1200,6 +1769,8 @@ def audio_callback(indata, frames, time_info, status):
                         noise_floor_level = pctile_val
             return
 
+        if water_started_time <= 0:
+            return  # 밸브 선행 구간에는 분석을 대기한다.
         filling_elapsed = elapsed - NOISE_CALIBRATION_TIME
 
         # ── [v5.50-RIDGE-TRACK] 공명선 누적·경로 계산 (가드 구간 포함 매 청크) ──
@@ -1786,17 +2357,12 @@ def audio_callback(indata, frames, time_info, status):
                       f' | adv:{total_advance:+.0f}%'
                       f' | smo:{stable_f:.0f}Hz ema:{f_for_stop:.0f}Hz'
                       f' | L:{current_air:.2f}cm')
-                solenoid_off_async()
-                with lock:
-                    history_freq_snapshot = list(history_freq)
-                    last_stop_elapsed_sec = filling_elapsed
-                    is_filling     = False
-                    request_finish = True
-                close_audio_stream_async(delay_sec=0.35)        # 자동 정지 후 분석용 오디오 스트림을 확실히 해제
+                stop_filling_local(True, reason='target_reached', immediate=False)
                 return
 
     except Exception as e:
         print(f'\n[AUDIO_CALLBACK_ERROR] {type(e).__name__}: {e}', flush=True)
+        stop_filling_local(True, reason='audio_error')  # 분석 오류 시 새 펌프와 밸브 정지
         return
 
 
@@ -1859,48 +2425,178 @@ def audio_callback_timed(indata, frames, time_info, status):
             _cb_late_count  = 0
 
 
+_audio_lifecycle_lock = threading.RLock()
+
+
 def ensure_audio_stream():
     global audio_stream
-    if audio_stream is not None:
+    with _audio_lifecycle_lock:
+        if audio_stream is not None:
+            return
+        stream = sd.InputStream(device=INPUT_DEVICE, callback=audio_callback_timed,
+                                channels=1, samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE)
+        try:
+            stream.start()
+        except Exception:
+            stream.close()
+            raise
+        audio_stream = stream
+
+
+def _close_audio_if_idle(stream_ref):
+    global audio_stream
+    if stream_ref is None:
         return
-    audio_stream = sd.InputStream(
-        device=INPUT_DEVICE,
-        callback=audio_callback_timed,   # [CB-DIAG] 계측 래퍼 등록(본체 audio_callback은 그대로)
-        channels=1,
-        samplerate=SAMPLE_RATE,
-        blocksize=CHUNK_SIZE,
-    )
-    audio_stream.start()
+    with _audio_lifecycle_lock:
+        with lock:
+            if is_filling or audio_stream is not stream_ref:
+                return
+            audio_stream = None
+        try:
+            stream_ref.stop()
+        except Exception as exc:
+            print(f'[CORE] audio stop: {exc}')
+        finally:
+            try:
+                stream_ref.close()
+            except Exception as exc:
+                print(f'[CORE] audio close: {exc}')
+
 
 def close_audio_stream_async(delay_sec=0.35):
-    """급수 종료 후 급수 분석용 sounddevice 스트림을 비동기로 정리한다."""
-    global audio_stream
-
-    stream_ref = audio_stream                                      # 현재 스트림 참조를 고정
-    if stream_ref is None:                                         # 열린 분석 스트림이 없으면 종료
+    """콜백이 끝난 뒤 스트림을 정리. 새 급수와의 생성/해제 경합을 막는다."""
+    stream_ref = audio_stream
+    if stream_ref is None or _shutting_down:
         return
-
     def _worker():
-        global audio_stream
-        time.sleep(max(0.0, float(delay_sec)))                     # 콜백 종료 여유 시간
-        try:
-            with lock:
-                still_filling = bool(is_filling)                  # 새 급수가 시작됐는지 확인
-            if still_filling:
-                return                                             # 급수 중이면 닫지 않음
-            if audio_stream is not stream_ref:
-                return                                             # 다른 스트림으로 바뀌었으면 보호
-            try:
-                stream_ref.stop()                                  # PortAudio 스트림 정지
-            except Exception:
-                pass
-            try:
-                stream_ref.close()                                 # 오디오 장치 해제
-            except Exception:
-                pass
-            audio_stream = None                                    # 다음 급수 때 새로 열도록 초기화
-            print('\n[CORE] 급수 분석 audio_stream 정리 완료')
-        except Exception as e:
-            print(f'\n[CORE] audio_stream 정리 오류: {e}')
+        time.sleep(max(0.0, float(delay_sec)))
+        _close_audio_if_idle(stream_ref)
+    threading.Thread(target=_worker, name='audio-close', daemon=True).start()
 
-    threading.Thread(target=_worker, daemon=True).start()           # GUI/오디오 콜백을 막지 않음
+
+# ──────────────────────────────────────────────────────────────────
+# 4. GUI·음성·버튼 요청 연결
+# ──────────────────────────────────────────────────────────────────
+
+
+def bind_controls(app, gui_on, gui_off, on_level, on_error):
+    initialize_hardware()
+
+    def request_start():
+        if getattr(app, '_water_closing', False):
+            return False
+        reply = queue.Queue(maxsize=1)
+        generation = hardware_status()['stop_generation']
+        ui_requests.put(('start', generation, reply))
+        try:
+            return reply.get(timeout=5.0)
+        except queue.Empty:
+            # 늦게 처리되는 시작도 취소한다.
+            stop_filling_local(True, reason='start_request_timeout')
+            return False
+
+    def request_stop():
+        if getattr(app, '_water_closing', False):
+            return
+        stop_filling_local(True, reason='voice_stop')  # GUI 응답을 기다리지 않고 출력 OFF
+        ui_requests.put(('stop', None))
+
+    def poll():
+        if getattr(app, '_water_closing', False):
+            return
+        try:
+            for _ in range(30):
+                if getattr(app, '_water_closing', False):
+                    break
+                try:
+                    item = ui_requests.get_nowait()
+                except queue.Empty:
+                    break
+                kind, value = item[:2]
+                reply = item[2] if len(item) > 2 else None
+                ok = False
+                try:
+                    if kind == 'start':
+                        if value == hardware_status()['stop_generation']:
+                            ok = bool(gui_on(expected_generation=value))
+                    elif kind == 'stop':
+                        gui_off()
+                    elif kind == 'level':
+                        on_level(value)
+                except Exception as exc:
+                    stop_filling_local(True, reason='gui_error')
+                    on_error(str(exc))
+                finally:
+                    if reply is not None:
+                        reply.put_nowait(ok)
+        finally:
+            if not getattr(app, '_water_closing', False):
+                app.after(20, poll)
+
+    if VOICE_ENABLED:
+        try:
+            import voice_module as vm
+            vm.register_gui_callbacks(request_start, request_stop)
+            vm.register_gui_level_callback(lambda pct: ui_requests.put(('level', pct)))
+        except ImportError as exc:
+            print(f'[음성 모듈 사용 불가] {exc}')
+    app.after(20, poll)
+
+
+def shutdown_gui():
+    """새 음성 요청을 끊고 출력 OFF 후 대기 중인 시작 응답을 해제한다."""
+    vm = sys.modules.get('voice_module')
+    if vm is not None:
+        vm._shutdown.set()
+        vm.register_gui_callbacks(None, None)
+        vm.register_gui_level_callback(None)
+    try:
+        shutdown_hardware()
+    finally:
+        while True:
+            try:
+                item = ui_requests.get_nowait()
+            except queue.Empty:
+                break
+            if len(item) > 2:
+                try:
+                    item[2].put_nowait(False)
+                except queue.Full:
+                    pass
+
+
+# ──────────────────────────────────────────────────────────────────
+# 5. GUI 종료 및 예약 콜백 정리
+# ──────────────────────────────────────────────────────────────────
+
+
+def cancel_pending_callbacks(app):
+    import tkinter as tk  # GUI를 닫을 때만 Tk 의존성을 사용한다.
+    try:
+        jobs = app.tk.call('after', 'info')
+        if isinstance(jobs, str):
+            jobs = app.tk.splitlist(jobs)
+        for job in jobs:
+            # 자식 위젯/CustomTkinter 작업도 포함한다. Python 명령 삭제는
+            # 소유 위젯의 destroy에 맡겨 중복 deletecommand 오류를 방지한다.
+            app.tk.call('after', 'cancel', job)
+    except tk.TclError:
+        pass  # 이미 Tcl 인터프리터가 종료된 경우
+
+
+def close_window(app, before_destroy=None):
+    if getattr(app, '_water_closing', False):
+        return
+    app._water_closing = True  # 현재 실행 중인 콜백의 재예약도 차단
+    cancel_pending_callbacks(app)
+    try:
+        if before_destroy is not None:
+            before_destroy()
+    finally:
+        cancel_pending_callbacks(app)
+        try:
+            app.destroy()
+        finally:
+            cancel_pending_callbacks(app)
+            app.quit()
+
