@@ -1,4 +1,10 @@
-# smart_water_core.py  ── v5.32-time-q-bridge
+# smart_water_core.py  ── v5.33-root-fix (smart_water_core_ver1)
+#
+# [v5.33-ROOT-FIX] 조기 정지(5~10%) 원인별 수정 — 플래그를 모두 False로 두면 v5.32와 동일
+#   ENABLE_CTRL_UNBIASED : 정지용 주파수 상향 래칫(비대칭 EMA) → 대칭 게이트+중앙값+대칭 EMA
+#   ENABLE_H_FROM_VOLUME : H 고정 offset 표 → 초기주파수 확정 시점까지 들어간 부피/단면적, h_reg 이중 보정 제거
+#   ENABLE_MEASURED_Q    : D 역산 유량 상수 → 유량센서 실측 평균 (센서값 없으면 상수 fallback)
+#   [H진단] / [정지진단] 로그 추가 (플래그와 무관하게 항상 출력)
 #
 # [v5.32-TIME-Q-BRIDGE] 70% 이후 시간/유량 예측 브릿지 추가
 #   80~90% 고수위 목표에서 주파수 검출이 1800~2000Hz 부근에서 정체될 때,
@@ -542,6 +548,18 @@ BRIDGE_LOG_INTERVAL     = 0.5    # 브릿지 로그 출력 간격(s)
 TARGET_MAX_CHANGE_RATIO = 0.25
 INIT_AIR_OFFSET_CM      = 1.0   # fallback only
 
+# ── [v5.33-ROOT-FIX] 조기 정지 원인별 수정 (False로 두면 v5.32와 동일) ──
+ENABLE_CTRL_UNBIASED = True    # 정지용 주파수: 상향 래칫 EMA → 대칭 게이트+중앙값+대칭 EMA
+CTRL_MEDIAN_N        = 5       # raw 중앙값 창(청크)
+CTRL_EMA_ALPHA       = 0.35    # 대칭 EMA 계수
+CTRL_GATE_RATIO      = 1.15    # 현재값 대비 ±15% 밖은 스파이크로 버림
+CTRL_GATE_RESET_N    = 8       # 연속 거부 시 기준 재설정(실제 급변 추종용)
+ENABLE_H_FROM_VOLUME = True    # H 보정: 고정 offset 표 → 초기주파수 확정 시점까지 들어간 부피/단면적
+ENABLE_MEASURED_Q    = True    # D 역산 유량: 상수 → 유량센서 실측 평균
+MEASURED_Q_MIN       = 3.0     # 센서값 sanity 하한(ml/s)
+MEASURED_Q_MAX       = 40.0    # 센서값 sanity 상한(ml/s)
+MEASURED_Q_MIN_SEC   = 3.0     # 펌프 ON 후 이 시간 이전 평균은 배관 충진 영향으로 사용 안 함
+
 # ── [v5.32-DH-RECAL] 초기 공기층(H) 보정 ─────────────────────────
 INIT_OFFSET_LOW_FREQ_HZ      = 650.0
 INIT_OFFSET_MID_FREQ_HZ      = 850.0
@@ -706,6 +724,9 @@ reg_inv_freq_buffer   = deque(maxlen=200)
 diameter_candidates   = deque(maxlen=DIAM_CAND_MAXLEN)
 freq_buffer           = deque()
 _f_stop_ema           = 0.0          # [v5.29-ASYM-EMA] 비대칭 EMA 상태값
+_ctrl_raw_buf         = deque(maxlen=CTRL_MEDIAN_N)  # [v5.33] 제어용 raw 버퍼
+_ctrl_reject_cnt      = 0                            # [v5.33] 연속 스파이크 거부 수
+initial_stable_volume_ml = 0.0                       # [v5.33] 초기주파수 확정 시점 누적 부피
 
 is_filling              = False
 filling_start_time      = 0.0
@@ -991,6 +1012,57 @@ def _get_init_air_offset(init_f: float, diameter: float) -> float:
     if init_f < INIT_OFFSET_MID_FREQ_HZ:
         return INIT_OFFSET_LARGE_MID_CM if diameter >= INIT_OFFSET_LARGE_D_CM else INIT_OFFSET_SMALL_MID_CM
     return INIT_OFFSET_HIGH_FREQ_CM
+
+
+# ════════════════════════════════════════════════════════════════════
+#  [v5.33-ROOT-FIX] 보조 함수
+# ════════════════════════════════════════════════════════════════════
+def _ctrl_freq_update(prev: float, raw: float, buf: deque, reject_cnt: int):
+    """정지용 주파수 갱신. 위/아래를 같은 규칙으로 다뤄 상향 누적(래칫)을 없앤다.
+    반환: (새 제어 주파수, 새 연속거부 수)"""
+    if not (math.isfinite(raw) and raw > 0):          # 입력 검증
+        return prev, reject_cnt
+    if prev > 0 and not (prev / CTRL_GATE_RATIO <= raw <= prev * CTRL_GATE_RATIO):
+        reject_cnt += 1
+        if reject_cnt < CTRL_GATE_RESET_N:
+            return prev, reject_cnt                    # 단발 스파이크: 버림
+        buf.clear()                                    # 연속 거부: 실제 변화로 보고 재설정
+        prev = 0.0
+    buf.append(raw)
+    med = float(np.median(buf))                        # 대칭 이상치 제거
+    new = med if prev <= 0 else prev * (1.0 - CTRL_EMA_ALPHA) + med * CTRL_EMA_ALPHA
+    return new, 0
+
+
+def _read_run_volume_ml() -> float:
+    """유량센서 누적 부피(mL, 이번 회차). 하드웨어 없음/오류 시 0.0."""
+    try:
+        v = float(hardware_status().get('run_volume_ml', 0.0))
+    except Exception:
+        return 0.0
+    return v if math.isfinite(v) and v > 0 else 0.0
+
+
+def _measured_q_ml_s() -> float:
+    """펌프 ON 이후 평균 유량(ml/s). 조건 불충족 시 0.0 → 호출 측에서 상수로 대체."""
+    t0 = water_started_time
+    if t0 <= 0:
+        return 0.0
+    dt = time.time() - t0
+    if dt < MEASURED_Q_MIN_SEC:
+        return 0.0
+    q = _read_run_volume_ml() / dt
+    return q if MEASURED_Q_MIN <= q <= MEASURED_Q_MAX else 0.0
+
+
+def _pre_fill_height_cm(vol_ml: float, t_init_s: float, diameter_cm: float) -> float:
+    """초기주파수 확정 시점까지 이미 찬 물 높이(cm) = V/A. 센서값 없으면 FLOW_RATE×t."""
+    if diameter_cm <= 0:
+        return INIT_AIR_OFFSET_CM
+    if vol_ml <= 0:
+        vol_ml = FLOW_RATE * max(0.0, t_init_s)        # fallback: 상수 유량
+    area = np.pi * (diameter_cm * 0.5) ** 2
+    return vol_ml / area
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1283,6 +1355,10 @@ def _regression_worker():
 
         # [v5.32-DH-RECAL] D 역산에 보정된 유효 유량 사용
         effective_Q = DIAMETER_EST_FLOW_RATE
+        if ENABLE_MEASURED_Q:                       # [v5.33] 실측 Q 우선, 없으면 상수
+            _q_meas = _measured_q_ml_s()
+            if _q_meas > 0:
+                effective_Q = _q_meas
         temp_D = np.sqrt(16 * effective_Q / (np.pi * SOUND_SPEED * abs(s_a)))
 
         if abs(s_a) < 0.000030:
@@ -1338,13 +1414,24 @@ def _regression_worker():
                 print(f'\n[v5.25] 용기 판별: {_cup_type} | D={_cur_d:.2f}cm | EMA scale={_scale_val:.2f}')
 
             if init_air_len_cm == 0.0 and _init_f > 0 and _cur_d > 0:
-                h_offset = _get_init_air_offset(_init_f, _cur_d)
+                if ENABLE_H_FROM_VOLUME:
+                    # [v5.33] h_init은 t_init 시점 공기층 → 그때까지 찬 물 높이만 더한다.
+                    #         h_reg는 회귀 절편(t=0, 펌프 ON) = 이미 빈 컵 기준 → 보정 없음.
+                    h_offset     = _pre_fill_height_cm(initial_stable_volume_ml,
+                                                       initial_stable_time, _cur_d)
+                    h_reg_offset = 0.0
+                else:
+                    h_offset     = _get_init_air_offset(_init_f, _cur_d)
+                    h_reg_offset = h_offset
                 h_init   = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _cur_d
                 h_reg    = SOUND_SPEED * theory_intercept / 4.0 - END_CORRECTION_K * _cur_d \
                            if (theory_locked and theory_intercept > 0) else 0.0
 
                 h_init_corr = h_init + h_offset
-                h_reg_corr  = h_reg  + h_offset if h_reg > 0 else 0.0
+                h_reg_corr  = h_reg  + h_reg_offset if h_reg > 0 else 0.0
+                print(f'\n[H진단] h_init={h_init:.2f}+{h_offset:.2f}={h_init_corr:.2f}cm'
+                      f' | h_reg={h_reg_corr:.2f}cm | V_init={initial_stable_volume_ml:.0f}mL'
+                      f' | t_init={initial_stable_time:.1f}s | D={_cur_d:.2f}cm')
 
                 last_init_air_by_initfreq_cm   = h_init_corr
                 last_init_air_by_regression_cm = h_reg_corr
@@ -1413,6 +1500,7 @@ def _reset_filling_state() -> None:
     global _stag_buffer, _stag_last_log
     global bridge_active, bridge_start_elapsed, bridge_start_fill_pct, bridge_pred_fill_pct
     global bridge_start_q, bridge_start_freq, bridge_eta_sec, bridge_last_log
+    global _ctrl_reject_cnt, initial_stable_volume_ml
 
     with lock:
         is_filling              = True
@@ -1420,6 +1508,9 @@ def _reset_filling_state() -> None:
         calibration_done        = False
         freq_buffer             = deque()
         _f_stop_ema             = 0.0    # [v5.29-ASYM-EMA]
+        _ctrl_raw_buf.clear()            # [v5.33]
+        _ctrl_reject_cnt        = 0
+        initial_stable_volume_ml = 0.0
         last_stop_elapsed_sec   = 0.0
         last_raw_stop_freq      = 0.0
         last_decision_freq      = 0.0
@@ -1516,6 +1607,7 @@ def audio_callback(indata, frames, time_info, status):
     global _stag_buffer, _stag_last_log
     global bridge_active, bridge_start_elapsed, bridge_start_fill_pct, bridge_pred_fill_pct
     global bridge_start_q, bridge_start_freq, bridge_eta_sec, bridge_last_log
+    global _ctrl_reject_cnt, initial_stable_volume_ml
 
     if not is_filling:
         return
@@ -1646,8 +1738,11 @@ def audio_callback(indata, frames, time_info, status):
         consecutive_loss_count = 0
         raw_f_for_reg = float(detected_f)   # EMA 이전 raw 주파수
 
-        # 변경
-        if _f_stop_ema <= 0:
+        if ENABLE_CTRL_UNBIASED:
+            # [v5.33] 위·아래 같은 규칙 → 노이즈/스파이크가 위쪽으로 누적되지 않음
+            _f_stop_ema, _ctrl_reject_cnt = _ctrl_freq_update(
+                _f_stop_ema, raw_f_for_reg, _ctrl_raw_buf, _ctrl_reject_cnt)
+        elif _f_stop_ema <= 0:      # ↓ v5.32 비대칭 EMA (비교용으로 유지)
             _f_stop_ema = raw_f_for_reg
         elif raw_f_for_reg >= _f_stop_ema:
             _f_stop_ema = (_f_stop_ema * (1 - FSCORE_ALPHA_UP)
@@ -1778,6 +1873,9 @@ def audio_callback(indata, frames, time_info, status):
             if stable_f < _last_s * MONO_DROP_RATIO:
                 stable_f = _last_s
 
+        # [v5.33] 초기주파수 확정 전 구간에서만 누적 부피를 읽는다(락 밖에서 읽어 락 순서 문제 회피)
+        _vol_now = _read_run_volume_ml() if (ENABLE_H_FROM_VOLUME and _init <= 0) else 0.0
+
         with lock:
             history_time.append(filling_elapsed)
             history_freq.append(stable_f)
@@ -1793,6 +1891,7 @@ def audio_callback(indata, frames, time_info, status):
                 if len(init_stable_buffer) >= 10:
                     initial_stable_freq = float(np.percentile(list(init_stable_buffer), 85))
                     initial_stable_time = float(filling_elapsed)
+                    initial_stable_volume_ml = float(_vol_now)   # [v5.33]
                     print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz | t={initial_stable_time:.1f}s')
 
         # ── [v5.30-PKFLOOR] spike 시 max_freq_seen 갱신 차단 ─────────
@@ -2071,6 +2170,14 @@ def audio_callback(indata, frames, time_info, status):
                       f' | adv:{total_advance:+.0f}%'
                       f' | smo:{stable_f:.0f}Hz ema:{f_for_stop:.0f}Hz'
                       f' | L:{current_air:.2f}cm')
+                # [v5.33] 원인 분리용: 음향 수위 vs 유량센서 부피 기반 수위(원통 가정)
+                _v_total = _read_run_volume_ml()
+                _area    = np.pi * (_cur_d2 * 0.5) ** 2 if _cur_d2 > 0 else 0.0
+                _flow_pct = (_v_total / (_area * _init_air) * 100.0) if (_area > 0 and _init_air > 0) else 0.0
+                print(f'[정지진단] H={_init_air:.2f}cm L={current_air:.2f}cm D={_cur_d2:.2f}cm'
+                      f' | V={_v_total:.0f}mL Q실측={_measured_q_ml_s():.1f}ml/s'
+                      f' | 음향={fill_pct:.1f}% 유량기반={_flow_pct:.1f}%'
+                      f' | ema-smo={f_for_stop - stable_f:+.0f}Hz')
                 stop_filling_local(True, reason='target_reached', immediate=False)
                 return
 
@@ -2313,4 +2420,3 @@ def close_window(app, before_destroy=None):
         finally:
             cancel_pending_callbacks(app)
             app.quit()
-
